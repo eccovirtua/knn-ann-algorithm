@@ -1,0 +1,11 @@
+# Entornos virtuales
+.venv
+__pycache__
+
+# Archivos de Git
+.git
+.gitignore
+
+# Otros que no necesitas en la imagen
+*.pyc
+.DS_Store
