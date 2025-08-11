@@ -1,19 +1,27 @@
-# Dockerfile
-FROM python:3.13-slim
+# Baseline: slim para imagen pequeña
+FROM python:3.11-slim
 
-# 1. Establece el directorio de trabajo
+# dependencias del sistema necesarias para compilar paquetes (annoy) y pyarrow
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    cmake \
+    libatlas-base-dev \
+    git \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# 2. Copia dependencias y las instala
+# Copia requirements primero para cachear capas
 COPY requirements.txt .
+
+# Instala paquetes
 RUN pip install --no-cache-dir -r requirements.txt
 
-# 3. Copia el código y los artefactos
-COPY services/ services/
-COPY data/vectorized/ data/vectorized/
+# Copia código
+COPY . .
 
-# 4. Expone el puerto que usará Uvicorn
-EXPOSE 8000
+# Exponer puerto (Render inyecta $PORT al run)
+ENV PORT=8000
 
-# 5. Comando de arranque
-CMD ["uvicorn", "services.recs_api:app", "--host", "0.0.0.0", "--port", "8000"]
+# Comando de inicio usando gunicorn + uvicorn worker (más robusto)
+CMD ["gunicorn", "-k", "uvicorn.workers.UvicornWorker", "services.recs_api:app", "--bind", "0.0.0.0:$PORT", "--workers", "1", "--log-level", "info"]

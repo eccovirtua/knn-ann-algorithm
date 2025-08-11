@@ -9,3 +9,5 @@ __pycache__
 # Otros que no necesitas en la imagen
 *.pyc
 .DS_Store
+.env
+data/
