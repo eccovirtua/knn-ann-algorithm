@@ -1,5 +1,6 @@
 # services/recs_api.py
 import os
+import sys
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 import pandas as pd
@@ -15,14 +16,18 @@ from pymongo import MongoClient
 from datetime import datetime
 from dotenv import load_dotenv
 import logging
-
 from starlette.middleware.cors import CORSMiddleware
 
 logger = logging.getLogger("recs_api")
 logging.basicConfig(level=logging.INFO)
+handler = logging.StreamHandler(sys.stdout)
+formatter = logging.Formatter("%(asctime)s %(levelname)s %(name)s - %(message)s")
+handler.setFormatter(formatter)
+logger.addHandler(handler)
 
-#cargar el .env y conectar a mi atlasdb(mongo)xddddddddddd
 load_dotenv()
+_ready = False
+
 
 
 MONGO_URI = os.getenv("MONGODB_URI")
@@ -32,9 +37,6 @@ if not MONGO_URI:
 mongo = MongoClient(MONGO_URI)
 db = mongo.get_database()             # base de datos por defecto de tu URI
 feedback_col = db["feedback"]         # colección para almacenar feedback
-
-
-
 
 
 
