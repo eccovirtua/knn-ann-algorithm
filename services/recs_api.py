@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import List, Tuple
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
-from jwt import decode
+from datetime import UTC
 from enum import Enum
 from pymongo import MongoClient
 from datetime import datetime
@@ -51,7 +51,7 @@ def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(sec
     """
     token = credentials.credentials #extrae el string del token
     try:
-        payload = decode(token, JWT_SECRET, algorithms=["HS256"])
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
         # decode verifica la firma y decodifica el payload
         return payload.get("userId") or payload.get("sub")
         # Devuelve userId (o sub) del payload
@@ -123,7 +123,7 @@ class SeedResponse(BaseModel):
 
 def save_feedback(user_id: str, domain: str, item_id: str, feedback: int):
     """Upsert: si existe actualiza feedback+ts(timestamp), si no existe lo inserta."""
-    now = datetime.utcnow()
+    now = datetime.now(UTC)
     feedback_col.update_one(
         {"user_id": user_id, "domain": domain, "item_id": item_id},
         {"$set": {"feedback": feedback, "ts": now}},
@@ -190,6 +190,20 @@ class Domain(str, Enum):
 
 
 
+#funcion helper para evitar el codigo duplicado
+def generate_new_seed(domain: str) -> RecItem:
+    candidates = items_df[items_df["domain"] == domain]
+    if candidates.empty:
+        raise HTTPException(404, "no hay items para el dominio")
+    row = candidates.sample(1).iloc[0]
+    return RecItem(
+        item_id=row["itemId"],
+        title=row["title"],
+        distance=0.0,
+        image_url=row.get["image_url", None]
+    )
+
+
 #Decide una lógica muy simple para el primer seed (p. ej. un ítem aleatorio del dominio solicitado).
 @app.get("/seed/{domain}", response_model=SeedResponse)
 def get_initial_seed(
@@ -218,20 +232,13 @@ def get_initial_seed(
             clear_history(user_id, dom)
 
     # No hay historial → crear seed aleatoria y guardarla con feedback 0 (neutra)
-    candidates = items_df[items_df["domain"] == dom]
-    if candidates.empty:
-        raise HTTPException(404, "No hay ítems para ese dominio")
-    row = candidates.sample(1).iloc[0]
-    seed = RecItem(item_id=row["itemId"], title=row["title"], distance=0.0,
-                   image_url=row.get("image_url", None))
-
-    save_feedback(user_id, dom, seed.item_id, 0)  # marca la seed inicial como mostrada (feedback neutro)
+    seed = generate_new_seed(dom)
+    save_feedback(user_id, dom, seed.item_id, 0)
     return SeedResponse(seed_item=seed)
 
 
-
 @app.post("/feedback/{domain}", response_model=SeedResponse)
-def feedback(
+def handle_feedback(
         domain: Domain,
         req: FeedbackRequest,
         user_id: str = Depends(get_user_id_from_jwt)
@@ -293,17 +300,10 @@ def reset_recs(
     clear_history(user_id, dom)
 
     # Escoge una semilla aleatoria del dominio
-    candidates = items_df[items_df["domain"] == dom]
-    if candidates.empty:
-        raise HTTPException(404, "No hay ítems para ese dominio")
-    row = candidates.sample(1).iloc[0]
-    seed = RecItem(item_id=row["itemId"], title=row["title"], distance=0.0,
-                   image_url=row.get("image_url", None))
-
-    # Guardar la seed inicial con feedback neutro (0) para que subsequent calls devuelvan la misma seed
+    seed = generate_new_seed(dom)
     save_feedback(user_id, dom, seed.item_id, 0)
-
     return SeedResponse(seed_item=seed)
+
 
 def compute_next_seed(user_id: str, domain: str) -> RecItem | None:
     """
@@ -319,7 +319,6 @@ def compute_next_seed(user_id: str, domain: str) -> RecItem | None:
 
     # Conjuntos/listas útiles
     shown = {item for item, _ in history if item}            # todos los mostrados (positivos, negativos y neutrales)
-    negatives = {item for item, fb in history if fb < 0}     # rechazados
     positives = [item for item, fb in history if fb > 0]     # LISTA preservando orden cronológico
 
     # 1) Si hay positivos, tomar el último (más reciente) y explorar vecinos
