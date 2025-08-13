@@ -203,7 +203,7 @@ def generate_new_seed(domain: str) -> RecItem:
         item_id=row["itemId"],
         title=row["title"],
         distance=0.0,
-        image_url=row.get["image_url", None]
+        image_url=row.get("image_url", None)
     )
 
 
