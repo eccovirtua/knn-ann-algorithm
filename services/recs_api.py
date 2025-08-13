@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Tuple
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 import jwt
+from jwt.exceptions import InvalidTokenError
 from datetime import UTC
 from enum import Enum
 from pymongo import MongoClient
@@ -58,7 +59,7 @@ def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(sec
         return payload.get("userId") or payload.get("sub")
         # Devuelve userId (o sub) del payload
 
-    except jwt.PyJWTError:
+    except InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
         #revisar ya que esta fallando autenticación en cada nueva instancia de aplicacion
 
