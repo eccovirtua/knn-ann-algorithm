@@ -367,3 +367,4 @@ def compute_next_seed(user_id: str, domain: str) -> RecItem | None:
     # 3) Si ya se vieron todos los items
     logger.info("No quedan candidatos para user=%s domain=%s (todos mostrados)", user_id, domain)
     return None
+
