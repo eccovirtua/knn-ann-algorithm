@@ -67,7 +67,7 @@ VECT_DIR = BASE_DIR / "data" / "vectorized"
 items_df = pd.read_parquet(VECT_DIR / "items.parquet").reset_index(drop=True)
 movieid_to_index = { item: i for i, item in enumerate(items_df["itemId"].tolist()) }
 
-embeds = np.load(VECT_DIR / "items_embeds.npz")["embeds"]
+embeds = np.load(VECT_DIR / "items_embeds.npz")["embeddings"]
 dim = embeds.shape[1]
 ann_index = AnnoyIndex(dim, metric="angular")
 ann_index.load(str(VECT_DIR / "items_index.ann"))
