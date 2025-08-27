@@ -636,7 +636,7 @@ def reset_recs(domain: Domain, user_id: str = Depends(get_user_id_from_jwt)):
     return SeedResponse(seed_item=seed)
 
 # ---------- Session endpoints (new flow) ----------
-@app.post("/session/{domain}", response_model=SessionCreateResponse)
+@app.post("/session/{domain}/create", response_model=SessionCreateResponse)
 def api_create_session(domain: Domain, user_id: str = Depends(get_user_id_from_jwt)):
     dom = domain.value
     session_id, seed = create_session(user_id, dom)
