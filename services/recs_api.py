@@ -587,6 +587,10 @@ def reset_recs(domain: Domain, user_id: str = Depends(get_user_id_from_jwt)):
     save_feedback(user_id, dom, seed.item_id, 0)
     return SeedResponse(seed_item=seed)
 
+
+
+
+
 # ---------- Session endpoints (nuevo flujo) ----------
 def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
     session_id = str(uuid4())
@@ -607,6 +611,23 @@ def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
     # (legado) guardado en colección paralela — no se usa como fuente
     session_feedback_col.insert_one({"session_id": session_id, "item_id": seed.item_id, "feedback": 0, "ts": now})
     return session_id, seed
+
+
+@app.get("/user/final-grid/{domain}", response_model=FinalListResponse)
+def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """
+    Devuelve el grid final existente para un usuario y dominio
+    """
+    # Buscar la última sesión finalizada del usuario en ese dominio
+    session = db.sessions.find_one({
+        "user_id": user_id,
+        "domain": domain,
+        "finished": True
+    })
+    if not session or not session.get("final_grid"):
+        raise HTTPException(404, "No final grid found for this domain")
+
+    return FinalListResponse(recommendations=session["final_grid"])
 
 def get_session(session_id: str):
     return sessions_col.find_one({"session_id": session_id})
