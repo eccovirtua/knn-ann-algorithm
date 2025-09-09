@@ -20,9 +20,8 @@ from annoy import AnnoyIndex
 from pymongo import MongoClient
 import jwt
 from jwt.exceptions import InvalidTokenError
-
-
-
+from services.tmdb_api import get_movie_poster
+from services.lastfm_api import get_album_art
 
 # ---------- logging ----------
 logger = logging.getLogger("recs_api")
@@ -172,6 +171,42 @@ GAMMA_IMDB = 0.10
 DELTA_NOVELTY = 0.40
 
 # ---------- utils dominio/genres/popularity ----------
+
+
+def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
+    image_url = row.get("image_url")
+
+    # Movies → TMDB
+    if row.get("domain") == "movie" and not image_url:
+        image_url = get_movie_poster(row.get("title"))
+
+    # Music → Last.fm
+    elif row.get("domain") == "music" and not image_url:
+        artist = row.get("artist", "")
+        track = row.get("title", "")
+
+        # Si no hay columna "artist", intentamos parsear "artist - track"
+        if not artist and "-" in track:
+            parts = track.split("-", 1)  # solo dividimos en 2
+            artist = parts[0].strip()
+            track = parts[1].strip()
+
+        if artist and track:
+            import asyncio
+            try:
+                image_url = asyncio.run(get_album_art(artist, track))
+            except RuntimeError:
+                # Si ya estamos dentro de un event loop (FastAPI), corremos la tarea
+                loop = asyncio.get_event_loop()
+                image_url = loop.run_until_complete(get_album_art(artist, track))
+
+    return RecItem(
+        item_id=row["itemId"],
+        title=row["title"],
+        distance=distance,
+        image_url=image_url
+    )
+
 def _genres_to_set(genres):
     """Normaliza la columna genres (lista o string 'a|b')."""
     if genres is None:
@@ -254,12 +289,12 @@ def compute_next_seed(user_id: str, domain: str) -> Optional[RecItem]:
                 row = items_df.iloc[neigh_idx]
                 candidate_id = row["itemId"]
                 if row["domain"] == domain and candidate_id not in shown:
-                    return RecItem(item_id=candidate_id, title=row["title"], distance=0.0, image_url=row.get("image_url"))
+                    return row_to_recitem(row, distance=0.0)
     # fallback: random outside shown
     candidates = items_df[(items_df["domain"] == domain) & (~items_df["itemId"].isin(shown))]
     if not candidates.empty:
         row = candidates.sample(1).iloc[0]
-        return RecItem(item_id=row["itemId"], title=row["title"], distance=0.0, image_url=row.get("image_url"))
+        return row_to_recitem(row, distance=0.0)
     return None
 
 def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domain: str) -> Optional[RecItem]:
@@ -291,7 +326,7 @@ def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domai
             pool += random.sample(far, min(3, len(far)))
         n_idx, _ = random.choice(pool)
         row = items_df.iloc[n_idx]
-        return RecItem(item_id=row["itemId"], title=row["title"], distance=0.0, image_url=row.get("image_url"))
+        return row_to_recitem(row, distance=0.0)
 
     elif last_feedback < 0:  # 👎 Dislike
         vec = embeds[idx]
@@ -517,7 +552,7 @@ def build_final_grid(session_id: str,
             # fallback por index basado en filtro
             row = items_df[items_df["itemId"] == iid].iloc[0]
         final_items.append(
-            RecItem(item_id=row["itemId"], title=row["title"], distance=0.0, image_url=row.get("image_url"))
+            row_to_recitem(row, distance=0.0)
         )
 
     # persistir en la sesión
@@ -540,7 +575,7 @@ def recommend(req: RecommendRequest):
     recs = []
     for n_idx, dist in zip(neigh_idxs[1:], dists[1:]):
         row = items_df.iloc[n_idx]
-        recs.append(RecItem(item_id=row["itemId"], title=row["title"], distance=dist, image_url=row.get("image_url")))
+        recs.append(row_to_recitem(row, distance=0.0))
     return RecommendResponse(item_id=req.item_id, recommendations=recs)
 
 @app.post("/recommend/diverse")
@@ -560,7 +595,7 @@ def get_initial_seed(domain: Domain, user_id: str = Depends(get_user_id_from_jwt
         last_item_id, _ = history[-1]
         if last_item_id in movieid_to_index:
             row = items_df.loc[movieid_to_index[last_item_id]]
-            return SeedResponse(seed_item=RecItem(item_id=row["itemId"], title=row["title"], distance=0.0, image_url=row.get("image_url")))
+            return row_to_recitem(row, distance=0.0)
         else:
             clear_history(user_id, dom)
     seed = generate_new_seed(dom)
@@ -675,7 +710,7 @@ def api_get_session(session_id: str, user_id: str = Depends(get_user_id_from_jwt
     last_item_id = s.get("last_item_id")
     if last_item_id and last_item_id in movieid_to_index:
         row = items_df.loc[movieid_to_index[last_item_id]]
-        last_item = RecItem(item_id=row["itemId"], title=row["title"], distance=0.0, image_url=row.get("image_url"))
+        last_item = row_to_recitem(row, distance=0.0)
     iterations = int(s.get("iterations", len(s.get("shown", [])) or 0))
     limit = int(s.get("limit", SESSION_ITER_LIMIT))
     finished = bool(s.get("finished", False) or (iterations >= limit))
