@@ -20,6 +20,8 @@ from annoy import AnnoyIndex
 from pymongo import MongoClient
 import jwt
 from jwt.exceptions import InvalidTokenError
+
+from services import tmdb_api
 from services.tmdb_api import get_movie_poster
 from services.lastfm_api import get_album_art
 
@@ -46,7 +48,8 @@ app.add_middleware(
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
-
+# monta el router con prefijo /external
+app.include_router(tmdb_api.router, prefix="/external", tags=["External APIs"])
 security = HTTPBearer()
 
 # ---------- Mongo (colecciones) ----------
