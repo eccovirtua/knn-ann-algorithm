@@ -176,18 +176,20 @@ DELTA_NOVELTY = 0.40
 def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
     image_url = row.get("image_url")
 
-    # Movies → TMDB
+    # --- Movies (TMDB) ---
     if row.get("domain") == "movie" and not image_url:
-        image_url = get_movie_poster(row.get("title"))
+        title = row.get("title", "")
+        clean_title = title.split("(")[0].strip()  # 👉 quitamos año o paréntesis
+        image_url = get_movie_poster(clean_title)
 
-    # Music → Last.fm
+    # --- Music (Last.fm) ---
     elif row.get("domain") == "music" and not image_url:
         artist = row.get("artist", "")
         track = row.get("title", "")
 
-        # Si no hay columna "artist", intentamos parsear "artist - track"
+        # Si viene como "Artist - Track"
         if not artist and "-" in track:
-            parts = track.split("-", 1)  # solo dividimos en 2
+            parts = track.split("-", 1)
             artist = parts[0].strip()
             track = parts[1].strip()
 
@@ -196,15 +198,22 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
             try:
                 image_url = asyncio.run(get_album_art(artist, track))
             except RuntimeError:
-                # Si ya estamos dentro de un event loop (FastAPI), corremos la tarea
                 loop = asyncio.get_event_loop()
                 image_url = loop.run_until_complete(get_album_art(artist, track))
 
+    # --- Books (Google Books ya trae image_url en muchos casos) ---
+    # Si no hay nada, dejamos que caiga al fallback genérico
+
+    # --- Fallback universal ---
+    if not image_url:
+        image_url = "https://placehold.co/300x450?text=No+Image"
+
     return RecItem(
-        item_id=row["itemId"],
+        item_id=row["item_id"],
         title=row["title"],
-        distance=distance,
-        image_url=image_url
+        # domain=row["domain"],
+        image_url=image_url,
+        distance=distance
     )
 
 def _genres_to_set(genres):
