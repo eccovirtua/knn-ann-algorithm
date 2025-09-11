@@ -20,9 +20,9 @@ from annoy import AnnoyIndex
 from pymongo import MongoClient
 import jwt
 from jwt.exceptions import InvalidTokenError
-
+import asyncio
 from services import tmdb_api
-from services.tmdb_api import get_movie_poster
+from services.tmdb_api import fetch_movie_poster
 from services.lastfm_api import get_album_art
 
 # ---------- logging ----------
@@ -176,45 +176,44 @@ DELTA_NOVELTY = 0.40
 # ---------- utils dominio/genres/popularity ----------
 
 
+
 def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
     image_url = row.get("image_url")
 
     # --- Movies (TMDB) ---
     if row.get("domain") == "movie" and not image_url:
         title = row.get("title", "")
-        clean_title = title.split("(")[0].strip()  # 👉 quitamos año o paréntesis
-        image_url = get_movie_poster(clean_title)
+        clean_title = title.split("(")[0].strip()
+
+        try:
+            image_url = asyncio.run(fetch_movie_poster(clean_title))
+        except RuntimeError:
+            loop = asyncio.get_event_loop()
+            image_url = loop.run_until_complete(fetch_movie_poster(clean_title))
 
     # --- Music (Last.fm) ---
     elif row.get("domain") == "music" and not image_url:
         artist = row.get("artist", "")
         track = row.get("title", "")
 
-        # Si viene como "Artist - Track"
         if not artist and "-" in track:
             parts = track.split("-", 1)
             artist = parts[0].strip()
             track = parts[1].strip()
 
         if artist and track:
-            import asyncio
             try:
                 image_url = asyncio.run(get_album_art(artist, track))
             except RuntimeError:
                 loop = asyncio.get_event_loop()
                 image_url = loop.run_until_complete(get_album_art(artist, track))
 
-    # --- Books (Google Books ya trae image_url en muchos casos) ---
-    # Si no hay nada, dejamos que caiga al fallback genérico
-
-    # --- Fallback universal ---
     if not image_url:
         image_url = "https://placehold.co/300x450?text=No+Image"
 
     return RecItem(
         item_id=row["item_id"],
         title=row["title"],
-        # domain=row["domain"],
         image_url=image_url,
         distance=distance
     )

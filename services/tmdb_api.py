@@ -35,7 +35,7 @@ async def fetch_movie_poster(title: str) -> str | None:
 @router.get("/movies/poster")
 async def get_movie_poster(title: str):
     """
-    Endpoint directo para consultar un póster por título.
+    Endpoint externo: recibe un título y devuelve el póster.
     """
     poster_url = await fetch_movie_poster(title)
     return {"poster": poster_url}
