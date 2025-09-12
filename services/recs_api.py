@@ -178,6 +178,10 @@ DELTA_NOVELTY = 0.40
 
 
 def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
+    print("DEBUG row keys:", row.keys())
+    print("DEBUG row content:", row.to_dict())
+
+
     image_url = row.get("image_url")
 
     # --- Movies (TMDB) ---
