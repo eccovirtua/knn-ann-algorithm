@@ -216,7 +216,7 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
         image_url = "https://placehold.co/300x450?text=No+Image"
 
     return RecItem(
-        item_id=row["item_id"],
+        item_id=row.get("item_id") or row.get("itemId"),
         title=row["title"],
         image_url=image_url,
         distance=distance
