@@ -669,15 +669,16 @@ def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_user_id_fr
     Devuelve el grid final existente para un usuario y dominio
     """
     # Buscar la última sesión finalizada del usuario en ese dominio
-    session = db.sessions.find_one({
-        "user_id": user_id,
-        "domain": domain,
-        "finished": True
-    })
-    if not session or not session.get("final_grid"):
-        raise HTTPException(404, "No final grid found for this domain")
+    session = db.sessions.find_one(
+        {"user_id": user_id, "domain": domain, "finished": True},
+        sort=[("created_at", -1)]
+    )
 
-    return FinalListResponse(recommendations=session["final_grid"])
+    if not session or "final_grid" not in session:
+        raise HTTPException(404, "No hay grid final para este usuario y dominio")
+
+    recs = [RecItem(**item) for item in session["final_grid"]]
+    return FinalListResponse(recommendations=recs)
 
 def get_session(session_id: str):
     return sessions_col.find_one({"session_id": session_id})
