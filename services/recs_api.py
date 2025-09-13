@@ -843,19 +843,21 @@ def api_get_final_grid(session_id: str, user_id: str = Depends(get_user_id_from_
 @app.post("/session/{session_id}/finalize", response_model=FinalListResponse)
 def api_session_finalize(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
     """
-    Alias de conveniencia: asegura finished y devuelve/crea el final grid.
+    Forzar que la sesión quede finalizada y devolver/crear el final grid,
+    aunque no haya iteraciones todavía.
     """
     s = get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
 
-    # forzar finished si alcanzó el límite por iterations/shown
-    iterations = int(s.get("iterations", len(s.get("shown", [])) or 0))
-    limit = int(s.get("limit", SESSION_ITER_LIMIT))
-    if iterations >= limit and not s.get("finished", False):
-        sessions_col.update_one({"session_id": session_id}, {"$set": {"finished": True}})
+    # marcar como finished siempre
+    sessions_col.update_one(
+        {"session_id": session_id},
+        {"$set": {"finished": True}}
+    )
 
-    return api_get_final_grid(session_id, user_id)  # reutiliza la lógica
+    # devolver el grid final (lo crea si no existe)
+    return api_get_final_grid(session_id, user_id)
 
 @app.get("/health")
 def health():
