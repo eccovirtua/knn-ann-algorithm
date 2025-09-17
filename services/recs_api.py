@@ -98,6 +98,7 @@ class FeedbackRequest(BaseModel):
     feedback: int  # -1 rechazo, +1 like, 0 neutro
 
 class SeedResponse(BaseModel):
+    session_id: str
     seed_item: Optional[RecItem] = None  # permitir None cuando la sesión termina
 
 # Session models
@@ -813,7 +814,7 @@ def api_session_reset(session_id: str, user_id: str = Depends(get_user_id_from_j
         "shown": [seed.item_id]
     }})
     session_feedback_col.insert_one({"session_id": session_id, "item_id": seed.item_id, "feedback": 0, "ts": datetime.now(timezone.utc)})
-    return SeedResponse(seed_item=seed)
+    return SeedResponse(session_id=session_id, seed_item=seed)
 
 @app.get("/session/{session_id}/final-grid", response_model=FinalListResponse)
 def api_get_final_grid(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
