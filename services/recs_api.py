@@ -116,6 +116,12 @@ class SessionStateResponse(BaseModel):
 class FinalListResponse(BaseModel):
     recommendations: List[RecItem]
 
+
+
+class SeedResponseWithSessionId(BaseModel):
+    session_id: str
+    seed_item: Optional[RecItem] = None
+
 # ---------- Enum de dominios ----------
 class Domain(str, Enum):
     movie = "movie"
@@ -279,7 +285,7 @@ def _rating_count(row: pd.Series) -> int:
                 continue
     return 0
 
-# ---------- Core algorithm: compute next seed from persisted history ----------
+# Core algorithm
 def generate_new_seed(domain: str) -> RecItem:
     candidates = items_df[items_df["domain"] == domain]
     if candidates.empty:
@@ -315,8 +321,8 @@ def compute_next_seed(user_id: str, domain: str) -> Optional[RecItem]:
 def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domain: str) -> Optional[RecItem]:
     """
     Nueva lógica de flujo interactivo:
-    - Like 👍: vecinos moderados (70% cercanos, 30% más lejanos).
-    - Dislike 👎: salto fuerte a ítems lejanos.
+    - Like: vecinos moderados (70% cercanos, 30% más lejanos).
+    - Dislike: salto fuerte a ítems lejanos.
     """
     shown = {item for item, _ in session_history}
     if not session_history:
@@ -629,17 +635,6 @@ def handle_feedback(domain: Domain, req: FeedbackRequest, user_id: str = Depends
         save_feedback(user_id, dom, new_seed.item_id, 0)
     return SeedResponse(seed_item=new_seed)
 
-@app.post("/reset/{domain}", response_model=SeedResponse)
-def reset_recs(domain: Domain, user_id: str = Depends(get_user_id_from_jwt)):
-    dom = domain.value
-    clear_history(user_id, dom)
-    seed = generate_new_seed(dom)
-    save_feedback(user_id, dom, seed.item_id, 0)
-    return SeedResponse(seed_item=seed)
-
-
-
-
 
 # ---------- Session endpoints (nuevo flujo) ----------
 def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
@@ -800,20 +795,44 @@ def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = D
 
     return SeedResponse(seed_item=new_seed)
 
-@app.post("/session/{session_id}/reset", response_model=SeedResponse)
+@app.post("/session/{session_id}/reset", response_model=SeedResponseWithSessionId)
 def api_session_reset(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
     s = get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
+
+    # Generar un nuevo session_id
+    new_session_id = str(uuid4())
+
+    # Reiniciar la sesión antigua en DB
     reset_session(session_id)
+
+    # Generar seed para la nueva sesión
     seed = generate_new_seed(s["domain"])
-    sessions_col.update_one({"session_id": session_id}, {"$set": {
-        "last_item_id": seed.item_id,
+
+    # Insertar nueva sesión en la DB con el nuevo session_id
+    sessions_col.insert_one({
+        "session_id": new_session_id,
+        "user_id": user_id,
+        "domain": s["domain"],
+        "iterations": 0,
+        "finished": False,
         "history": [(seed.item_id, 0)],
-        "shown": [seed.item_id]
-    }})
-    session_feedback_col.insert_one({"session_id": session_id, "item_id": seed.item_id, "feedback": 0, "ts": datetime.now(timezone.utc)})
-    return SeedResponse(seed_item=seed)
+        "shown": [seed.item_id],
+        "final_grid": None,
+        "last_item_id": seed.item_id,
+        "created_at": datetime.now(timezone.utc)
+    })
+
+    # Insertar feedback inicial
+    session_feedback_col.insert_one({
+        "session_id": new_session_id,
+        "item_id": seed.item_id,
+        "feedback": 0,
+        "ts": datetime.now(timezone.utc)
+    })
+
+    return SeedResponseWithSessionId(session_id=new_session_id, seed_item=seed)
 
 @app.get("/session/{session_id}/final-grid", response_model=FinalListResponse)
 def api_get_final_grid(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
