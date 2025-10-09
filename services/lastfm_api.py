@@ -33,6 +33,7 @@ async def get_album_art(artist: str, track: str) -> str | None:
             resp.raise_for_status()
             data = resp.json()
 
+
             album = data.get("track", {}).get("album")
             if album and "image" in album:
                 for img in reversed(album["image"]):
