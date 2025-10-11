@@ -205,27 +205,45 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
     elif row.get("domain") == "music" and not image_url:
         artist = row.get("artist", "")
         track = row.get("title", "")
+        item_id = row.get("item_id") or row.get("itemId") or ""
 
+        # 🧩 Intentar extraer artista y track desde item_id si no vienen en columnas
+        if not artist and item_id.startswith("lf-") and "_" in item_id:
+            try:
+                parts = item_id.replace("lf-", "", 1).split("_", 1)
+                artist = parts[0].strip()
+                track = parts[1].strip()
+
+            except Exception as err:  # ✅ nombre distinto evita "shadowing"
+                print(f"⚠️ Error extrayendo artista/track desde item_id: {err}")
+
+        # 🧩 Fallback: intentar dividir el título por guion
         if not artist and "-" in track:
             parts = track.split("-", 1)
             artist = parts[0].strip()
             track = parts[1].strip()
 
+        # 🧩 Consultar imagen del álbum en Last.fm
         if artist and track:
             try:
                 image_url = asyncio.run(get_album_art(artist, track))
             except RuntimeError:
                 loop = asyncio.get_event_loop()
                 image_url = loop.run_until_complete(get_album_art(artist, track))
+            except Exception as err:
+                print(f"⚠️ Error obteniendo imagen de Last.fm: {err}")
+                image_url = None
 
+        # --- Fallback general ---
     if not image_url:
         image_url = "https://placehold.co/300x450?text=No+Image"
 
+        # ✅ Crear y devolver el RecItem final
     return RecItem(
-        item_id=row.get("item_id") or row.get("itemId"),
-        title=row["title"],
-        image_url=image_url,
-        distance=distance
+        item_id=row.get("item_id"),
+        title=row.get("title", ""),
+        distance=distance,
+        image_url=image_url
     )
 
 def _genres_to_set(genres):
