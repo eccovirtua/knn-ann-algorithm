@@ -184,6 +184,9 @@ DELTA_NOVELTY = 0.40
 
 
 def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
+    item_id = row.get("item_id") or row.get("itemId")
+    if item_id is None:
+        print("⚠️ row_to_recitem recibió un row sin item_id válido:", row.to_dict())
     print("DEBUG row keys:", row.keys())
     print("DEBUG row content:", row.to_dict())
 
@@ -238,13 +241,13 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
     if not image_url:
         image_url = "https://placehold.co/300x450?text=No+Image"
 
-        # ✅ Crear y devolver el RecItem final
     return RecItem(
-        item_id=row.get("item_id"),
+        item_id=row.get("item_id") or row.get("itemId") or "",
         title=row.get("title", ""),
         distance=distance,
         image_url=image_url
     )
+
 
 def _genres_to_set(genres):
     """Normaliza la columna genres (lista o string 'a|b')."""
