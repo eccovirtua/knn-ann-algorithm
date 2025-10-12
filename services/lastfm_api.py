@@ -19,27 +19,31 @@ async def get_album_art(artist: str, track: str) -> str | None:
     track = clean_name(track)
 
     async with httpx.AsyncClient(timeout=10) as client:
-        # --- Intento con album.getInfo ---
+        # --- Nuevo Intento con track.getInfo ---
         try:
             params = {
-                "method": "album.getInfo",
+                "method": "track.getInfo", # <-- ¡Cambio aquí!
                 "api_key": LASTFM_API_KEY,
                 "artist": artist,
-                "album": track,
+                "track": track,           # <-- ¡Cambio aquí!
+                "autocorrect": 1,         # <-- ¡Muy útil para coincidencias!
                 "format": "json",
             }
             resp = await client.get(LASTFM_BASE_URL, params=params)
             resp.raise_for_status()
             data = resp.json()
 
-            album = data.get("album", {})
+            # La imagen ahora estará dentro de track.album.image
+            album = data.get("track", {}).get("album", {})
             if album and "image" in album:
+                # La lógica de Last.fm generalmente pone la imagen más grande al final (reversed)
                 for img in reversed(album["image"]):
                     url = img.get("#text")
                     if url and PLACEHOLDER not in url:
                         return url
         except Exception as e:
-            print(f"[LastFM album.getInfo] Error: {e}")
+            # Revisa la respuesta de Last.fm; si el track no existe, fallará.
+            print(f"[LastFM track.getInfo] Error: {e}")
 
     # Si no se encuentra una imagen válida:
     return None
