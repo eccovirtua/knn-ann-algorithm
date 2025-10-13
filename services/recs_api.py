@@ -24,7 +24,7 @@ import asyncio
 from services import tmdb_api
 from services.tmdb_api import fetch_movie_poster
 from services.lastfm_api import get_album_art
-
+from services.lastfm_api import PLACEHOLDER
 # ---------- logging ----------
 logger = logging.getLogger("recs_api")
 logger.setLevel(logging.INFO)
@@ -182,19 +182,22 @@ DELTA_NOVELTY = 0.40
 # ---------- utils dominio/genres/popularity ----------
 
 
-
 def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
     item_id = row.get("item_id") or row.get("itemId")
     if item_id is None:
         print("⚠️ row_to_recitem recibió un row sin item_id válido:", row.to_dict())
-    print("DEBUG row keys:", row.keys())
-    print("DEBUG row content:", row.to_dict())
+    # Omitimos prints de DEBUG si ya verificamos que funcionan
 
+    domain = row.get("domain")
+    image_url = row.get("image_url") # Leemos la URL del dataset
 
-    image_url = row.get("image_url")
+    # 💥 PASO 1: Invalidar el placeholder si es música
+    if domain == "music" and image_url == PLACEHOLDER:
+        # Ya verificaste que esta línea se ejecuta y pone la URL a None
+        image_url = None
 
     # --- Movies (TMDB) ---
-    if row.get("domain") == "movie" and not image_url:
+    if domain == "movie" and not image_url:
         title = row.get("title", "")
         clean_title = title.split("(")[0].strip()
 
@@ -204,8 +207,7 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
             loop = asyncio.get_event_loop()
             image_url = loop.run_until_complete(fetch_movie_poster(clean_title))
 
-    # --- Music (Last.fm) ---
-    elif row.get("domain") == "music" and not image_url:
+    elif domain == "music" and not image_url:
         artist = row.get("artist", "")
         track = row.get("title", "")
         item_id = row.get("item_id") or row.get("itemId") or ""
@@ -216,8 +218,7 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
                 parts = item_id.replace("lf-", "", 1).split("_", 1)
                 artist = parts[0].strip()
                 track = parts[1].strip()
-
-            except Exception as err:  # ✅ nombre distinto evita "shadowing"
+            except Exception as err:
                 print(f"⚠️ Error extrayendo artista/track desde item_id: {err}")
 
         # 🧩 Fallback: intentar dividir el título por guion
@@ -228,17 +229,18 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
 
         # 🧩 Consultar imagen del álbum en Last.fm
         if artist and track:
+            # print(f"👉 CALL: Intentando obtener arte para Artista: '{artist}', Track: '{track}'") # Opcional
             try:
-                image_url = asyncio.run(get_album_art(artist, track))
-            except RuntimeError:
-                loop = asyncio.get_event_loop()
-                image_url = loop.run_until_complete(get_album_art(artist, track))
+                # 📢 La función get_album_art debe retornar la URL real o None.
+                image_url = get_album_art(artist, track)
             except Exception as err:
                 print(f"⚠️ Error obteniendo imagen de Last.fm: {err}")
                 image_url = None
 
-        # --- Fallback general ---
+    # --- Fallback general ---
+    # 🌟 PASO 3: Reemplazar el None por el placeholder genérico si la búsqueda falló
     if not image_url:
+        # Usar el placeholder genérico si la búsqueda de la API falló (retorno de get_album_art es None)
         image_url = "https://placehold.co/300x450?text=No+Image"
 
     return RecItem(
@@ -312,7 +314,7 @@ def generate_new_seed(domain: str) -> RecItem:
     if candidates.empty:
         raise HTTPException(404, "no hay items para el dominio")
     row = candidates.sample(1).iloc[0]
-    return RecItem(item_id=row["itemId"], title=row["title"], distance=0.0, image_url=row.get("image_url"))
+    return row_to_recitem(row, distance=0.0)
 
 def compute_next_seed(user_id: str, domain: str) -> Optional[RecItem]:
     history = get_history(user_id, domain)
