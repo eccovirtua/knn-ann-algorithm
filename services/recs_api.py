@@ -388,7 +388,7 @@ def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domai
         for n_idx in neigh_idxs[1:]:
             row = items_df.iloc[n_idx]
             if row["domain"] == domain and row["itemId"] not in shown:
-                return RecItem(item_id=row["itemId"], title=row["title"], distance=0.0, image_url=row.get("image_url"))
+                return row_to_recitem(row, distance=0.0)
         return None
 
 # ---------- Fase 2: Filtrado + Boosting + Diversidad ----------
