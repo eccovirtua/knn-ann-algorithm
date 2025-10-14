@@ -5,7 +5,7 @@ import logging
 from enum import Enum
 from uuid import uuid4
 from pathlib import Path
-from typing import List, Tuple, Optional
+from typing import List, Tuple, Optional, Dict
 from dotenv import load_dotenv
 import math
 from fastapi import FastAPI, HTTPException, Depends
@@ -121,6 +121,44 @@ class FinalListResponse(BaseModel):
 class SeedResponseWithSessionId(BaseModel):
     session_id: str
     seed_item: Optional[RecItem] = None
+
+
+
+# --- Modelos ACTUALIZADOS para el Dashboard de Estadísticas ---
+
+class TimeStats(BaseModel):
+    """Modelo para las estadísticas de tiempo estimadas en horas."""
+    hours_interacting: float = 0.0
+    hours_from_final_recs: float = 0.0
+
+
+class DomainStats(BaseModel):
+    """Estadísticas para un dominio específico (music, book, movie) para el usuario actual."""
+    total_sessions: int = 0
+    finished_sessions: int = 0
+    total_items_shown: int = 0
+    items_liked: int = 0
+    items_rejected: int = 0
+    final_recs_generated: int = 0
+    time_stats: TimeStats
+
+
+class UserDashboardStats(BaseModel):
+    """Modelo principal para la respuesta del dashboard personal del usuario."""
+    # Métricas Globales (para el usuario actual)
+    total_sessions: int
+    finished_sessions: int
+    total_items_interacted: int
+    total_items_liked: int
+    total_items_rejected: int
+    total_final_recs_generated: int
+
+    # Métricas de Tiempo Globales (para el usuario actual)
+    total_time_stats: TimeStats
+
+    # Desglose por Dominio
+    domain_stats: Dict[str, DomainStats]
+
 
 # ---------- Enum de dominios ----------
 class Domain(str, Enum):
@@ -609,6 +647,139 @@ def build_final_grid(session_id: str,
                 user_id, session_id, domain, len(final_items), len(positives), len(hidden_ids), len(underdog_ids))
     return final_items
 
+
+# Constantes para estimación de tiempo en HORAS
+TIME_ESTIMATES = {
+    "movie": 1.75,  # 1 h 45 m en promedio por película
+    "book": 6.0,  # 6h en promedio por libro
+    "music": 0.058,  # 3.5 minutos en promedio por canción
+    "interaction_seconds": 30 / 3600  # 30 segundos por interacción, convertido a horas
+}
+
+
+def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
+    """
+    Calcula las estadísticas del dashboard para un usuario específico usando un
+    pipeline de agregación de MongoDB.
+    """
+
+    # 1. Pipeline de Agregación de MongoDB
+    pipeline = [
+        {
+            # Filtrar todas las sesiones para el usuario actual
+            '$match': {'user_id': user_id}
+        },
+        {
+            # Agrupar por dominio para calcular las estadísticas de cada uno
+            '$group': {
+                '_id': '$domain',
+                'total_sessions': {'$sum': 1},
+                'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
+                'total_items_shown': {'$sum': {'$size': '$history'}},
+                'items_liked': {
+                    '$sum': {
+                        '$size': {
+                            '$filter': {'input': '$history', 'as': 'item', 'cond': {'$eq': ['$$item.1', 1]}}
+                        }
+                    }
+                },
+                'items_rejected': {
+                    '$sum': {
+                        '$size': {
+                            '$filter': {'input': '$history', 'as': 'item', 'cond': {'$eq': ['$$item.1', -1]}}
+                        }
+                    }
+                },
+                'final_recs_generated': {
+                    '$sum': {
+                        '$cond': [
+                            {'$and': ['$finished', {'$ne': ['$final_grid', None]}]},
+                            {'$size': '$final_grid'},
+                            0
+                        ]
+                    }
+                }
+            }
+        }
+    ]
+
+    # Ejecutar la pipeline en la colección 'sessions'
+    results = list(sessions_col.aggregate(pipeline))
+
+    # 2. Postprocesamiento en Python
+    domain_stats_map: Dict[str, DomainStats] = {
+        "movie": DomainStats(time_stats=TimeStats()),
+        "book": DomainStats(time_stats=TimeStats()),
+        "music": DomainStats(time_stats=TimeStats())
+    }
+
+    for doc in results:
+        domain = doc['_id']
+        if domain in domain_stats_map:
+            # Calcular tiempo de interacción
+            hours_interacting = doc['total_items_shown'] * TIME_ESTIMATES['interaction_seconds']
+
+            # Calcular tiempo de consumo de recomendaciones finales
+            hours_from_recs = doc['final_recs_generated'] * TIME_ESTIMATES.get(domain, 0)
+
+            # Llenar el objeto DomainStats
+            domain_stats_map[domain] = DomainStats(
+                total_sessions=doc.get('total_sessions', 0),
+                finished_sessions=doc.get('finished_sessions', 0),
+                total_items_shown=doc.get('total_items_shown', 0),
+                items_liked=doc.get('items_liked', 0),
+                items_rejected=doc.get('items_rejected', 0),
+                final_recs_generated=doc.get('final_recs_generated', 0),
+                time_stats=TimeStats(
+                    hours_interacting=round(hours_interacting, 2),
+                    hours_from_final_recs=round(hours_from_recs, 2)
+                )
+            )
+
+    # 3. Calcular los totales globales sumando las estadísticas de cada dominio
+    total_stats = {
+        'total_sessions': 0,
+        'finished_sessions': 0,
+        'total_items_interacted': 0,
+        'total_items_liked': 0,
+        'total_items_rejected': 0,
+        'total_final_recs_generated': 0,
+        'total_hours_interacting': 0.0,
+        'total_hours_from_final_recs': 0.0
+    }
+
+    for domain in domain_stats_map:
+        stats = domain_stats_map[domain]
+        total_stats['total_sessions'] += stats.total_sessions
+        total_stats['finished_sessions'] += stats.finished_sessions
+        total_stats['total_items_interacted'] += stats.total_items_shown
+        total_stats['total_items_liked'] += stats.items_liked
+        total_stats['total_items_rejected'] += stats.items_rejected
+        total_stats['total_final_recs_generated'] += stats.final_recs_generated
+        total_stats['total_hours_interacting'] += stats.time_stats.hours_interacting
+        total_stats['total_hours_from_final_recs'] += stats.time_stats.hours_from_final_recs
+
+    return UserDashboardStats(
+        total_sessions=total_stats['total_sessions'],
+        finished_sessions=total_stats['finished_sessions'],
+        total_items_interacted=total_stats['total_items_interacted'],
+        total_items_liked=total_stats['total_items_liked'],
+        total_items_rejected=total_stats['total_items_rejected'],
+        total_final_recs_generated=total_stats['total_final_recs_generated'],
+        total_time_stats=TimeStats(
+            hours_interacting=round(total_stats['total_hours_interacting'], 2),
+            hours_from_final_recs=round(total_stats['total_hours_from_final_recs'], 2)
+        ),
+        domain_stats=domain_stats_map
+    )
+
+# --- Endpoint para el Dashboard ---
+@app.get("/stats/dashboard", response_model=UserDashboardStats)
+def api_get_user_dashboard_stats(user_id: str = Depends(get_user_id_from_jwt)):
+    """
+    Endpoint para obtener las estadísticas del dashboard personal de un usuario.
+    """
+    return get_user_dashboard_stats(user_id)
 # ---------- Endpoints: legacy recommend + seed + feedback + reset ----------
 @app.post("/recommend", response_model=RecommendResponse)
 def recommend(req: RecommendRequest):
