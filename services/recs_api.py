@@ -678,14 +678,18 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                         'as': 'item',
                         'in': {
                             'feedback_value': {
-                                '$toInt': {
-                                    '$arrayElemAt': [
-                                        {'$objectToArray': '$$item.1'},
-                                        0
-                                    ]
-                                }['v']
+                                '$let': {
+                                    'vars': {
+                                        'feedback_obj': {
+                                            '$arrayElemAt': [
+                                                {'$objectToArray': '$$item.1'},
+                                                0
+                                            ]
+                                        }
+                                    },
+                                    'in': {'$toInt': '$$feedback_obj.v'}
+                                }
                             },
-
                             'item_id': {'$arrayElemAt': ['$$item', 0]}
                         }
                     }
