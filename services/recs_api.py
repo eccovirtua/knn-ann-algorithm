@@ -666,35 +666,58 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
     # 1. Pipeline de Agregación de MongoDB
     pipeline = [
         {
-            # Filtrar todas las sesiones para el usuario actual
+            # 1. Filtrar todas las sesiones para el usuario actual
             '$match': {'user_id': user_id}
         },
         {
-            # Agrupar por dominio para calcular las estadísticas de cada uno
+            # 2. Agrupar por dominio para calcular las estadísticas de cada uno
             '$group': {
                 '_id': '$domain',
                 'total_sessions': {'$sum': 1},
                 'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
-                'total_items_shown': {'$sum': {'$size': '$history'}},
+
+                # ITEMS SHOWN: Usamos $ifNull para tratar 'history' como array vacío si es null
+                'total_items_shown': {'$sum': {
+                    '$size': {'$ifNull': ['$history', []]}
+                }},
+
+                # ITEMS LIKED:
+                # 1. $ifNull: Trata 'history' como [] si es null.
+                # 2. $filter: Itera sobre el historial.
+                # 3. $toInt: Convierte la cadena del feedback ("1" o "-1") a entero para la comparación.
                 'items_liked': {
                     '$sum': {
                         '$size': {
-                            '$filter': {'input': '$history', 'as': 'item', 'cond': {'$eq': ['$$item.1', 1]}}
+                            '$filter': {
+                                'input': {'$ifNull': ['$history', []]},
+                                'as': 'item',
+                                'cond': {'$eq': [{'$toInt': '$$item.1.$numberInt'}, 1]}
+                            }
                         }
                     }
                 },
+
+                # ITEMS REJECTED:
                 'items_rejected': {
                     '$sum': {
                         '$size': {
-                            '$filter': {'input': '$history', 'as': 'item', 'cond': {'$eq': ['$$item.1', -1]}}
+                            '$filter': {
+                                'input': {'$ifNull': ['$history', []]},
+                                'as': 'item',
+                                'cond': {'$eq': [{'$toInt': '$$item.1.$numberInt'}, -1]}
+                            }
                         }
                     }
                 },
+
+                # FINAL RECS GENERATED:
+                # 1. $ifNull: Trata 'final_grid' como [] si es null.
+                # 2. $cond: Solo cuenta si la sesión 'finished' es true.
                 'final_recs_generated': {
                     '$sum': {
                         '$cond': [
-                            {'$and': ['$finished', {'$ne': ['$final_grid', None]}]},
-                            {'$size': '$final_grid'},
+                            '$finished',
+                            {'$size': {'$ifNull': ['$final_grid', []]}},
                             0
                         ]
                     }
