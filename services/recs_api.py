@@ -670,26 +670,50 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
             '$match': {'user_id': user_id}
         },
         {
-            # 2. Pre-procesar 'history': Convertir el objeto {"$numberInt":"N"} a un entero simple.
+            # 2. Pre-procesar 'history': Convierte el objeto BSON de feedback a un entero.
             '$addFields': {
                 'history_processed': {
                     '$map': {
                         'input': {'$ifNull': ['$history', []]},
                         'as': 'item',
                         'in': {
+                            # Usa $let para definir variables internas y $cond para seguridad.
                             'feedback_value': {
                                 '$let': {
                                     'vars': {
-                                        'feedback_obj': {
-                                            '$arrayElemAt': [
-                                                {'$objectToArray': '$$item.1'},
-                                                0
-                                            ]
-                                        }
+                                        'feedback_target': '$$item.1'
                                     },
-                                    'in': {'$toInt': '$$feedback_obj.v'}
+                                    'in': {
+                                        '$cond': [
+                                            # Condición: Solo si el campo es un 'object' (tipo BSON 3)
+                                            {'$eq': [{'$type': '$$feedback_target'}, 'object']},
+
+                                            # Si es 'object': Realiza la conversión segura
+                                            {
+                                                '$toInt': {
+                                                    '$let': {
+                                                        'vars': {
+                                                            # feedback_obj es el array [{k: "$numberInt", v: "N"}]
+                                                            'feedback_obj': {
+                                                                '$arrayElemAt': [
+                                                                    {'$objectToArray': '$$feedback_target'},
+                                                                    0
+                                                                ]
+                                                            }
+                                                        },
+                                                        # Accede al valor 'v' (el número como string)
+                                                        'in': '$$feedback_obj.v'
+                                                    }
+                                                }
+                                            },
+
+                                            # Si NO es 'object': Asumimos 0 (o el valor por defecto que desees)
+                                            0
+                                        ]
+                                    }
                                 }
                             },
+                            # Mantenemos el ID del ítem
                             'item_id': {'$arrayElemAt': ['$$item', 0]}
                         }
                     }
@@ -697,18 +721,18 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
             }
         },
         {
-            # 3. Agrupar por dominio para calcular las estadísticas
+            # 3. Agrupar por dominio y calcular las estadísticas
             '$group': {
                 '_id': '$domain',
                 'total_sessions': {'$sum': 1},
                 'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
 
-                # TOTAL ITEMS SHOWN:
+                # TOTAL ITEMS SHOWN: (Basado en el array ya procesado)
                 'total_items_shown': {'$sum': {
                     '$size': '$history_processed'
                 }},
 
-                # ITEMS LIKED: Usamos el campo simple 'feedback_value'
+                # ITEMS LIKED: Filtra por el campo entero feedback_value = 1
                 'items_liked': {
                     '$sum': {
                         '$size': {
@@ -721,7 +745,7 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                     }
                 },
 
-                # ITEMS REJECTED:
+                # ITEMS REJECTED: Filtra por el campo entero feedback_value = -1
                 'items_rejected': {
                     '$sum': {
                         '$size': {
@@ -734,7 +758,7 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                     }
                 },
 
-                # FINAL RECS GENERATED:
+                # FINAL RECS GENERATED: (Sigue siendo robusto)
                 'final_recs_generated': {
                     '$sum': {
                         '$cond': [
