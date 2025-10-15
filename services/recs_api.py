@@ -676,43 +676,48 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                 'total_sessions': {'$sum': 1},
                 'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
 
-                # ITEMS SHOWN: Usamos $ifNull para tratar 'history' como array vacío si es null
+                # ITEMS SHOWN: (Sin cambios, sigue siendo robusto)
                 'total_items_shown': {'$sum': {
                     '$size': {'$ifNull': ['$history', []]}
                 }},
 
-                # ITEMS LIKED:
-                # 1. $ifNull: Trata 'history' como [] si es null.
-                # 2. $filter: Itera sobre el historial.
-                # 3. $toInt: Convierte la cadena del feedback ("1" o "-1") a entero para la comparación.
+                # 🎯 ITEMS LIKED: (CORRECCIÓN CON $objectToArray)
                 'items_liked': {
                     '$sum': {
                         '$size': {
                             '$filter': {
                                 'input': {'$ifNull': ['$history', []]},
                                 'as': 'item',
-                                'cond': {'$eq': [{'$toInt': '$$item.1.$numberInt'}, 1]}
+                                'cond': {
+                                    # Accede al objeto, lo convierte a array, toma el valor 'v' (que es "1"), y lo convierte a entero
+                                    '$eq': [{
+                                        '$toInt': {'$arrayElemAt': [{'$objectToArray': '$$item.1'}, 0]}.v
+                                    }, 1]
+                                }
                             }
                         }
                     }
                 },
 
-                # ITEMS REJECTED:
+                # 🎯 ITEMS REJECTED: (CORRECCIÓN CON $objectToArray)
                 'items_rejected': {
                     '$sum': {
                         '$size': {
                             '$filter': {
                                 'input': {'$ifNull': ['$history', []]},
                                 'as': 'item',
-                                'cond': {'$eq': [{'$toInt': '$$item.1.$numberInt'}, -1]}
+                                'cond': {
+                                    # Accede al objeto, lo convierte a array, toma el valor 'v' (que es "-1"), y lo convierte a entero
+                                    '$eq': [{
+                                        '$toInt': {'$arrayElemAt': [{'$objectToArray': '$$item.1'}, 0]}.v
+                                    }, -1]
+                                }
                             }
                         }
                     }
                 },
 
-                # FINAL RECS GENERATED:
-                # 1. $ifNull: Trata 'final_grid' como [] si es null.
-                # 2. $cond: Solo cuenta si la sesión 'finished' es true.
+                # FINAL RECS GENERATED: (Sigue siendo robusto)
                 'final_recs_generated': {
                     '$sum': {
                         '$cond': [
