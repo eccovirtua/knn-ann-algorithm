@@ -677,9 +677,15 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                         'input': {'$ifNull': ['$history', []]},
                         'as': 'item',
                         'in': {
-                            # 'feedback_value' es ahora el entero simple (0, 1, -1)
-                            'feedback_value': {'$toInt': {'$arrayElemAt': [{'$objectToArray': '$$item.1'}, 0]}.v},
-                            # Mantenemos el ID del ítem
+                            'feedback_value': {
+                                '$toInt': {
+                                    '$arrayElemAt': [
+                                        {'$objectToArray': '$$item.1'},
+                                        0
+                                    ]
+                                }['v']
+                            },
+
                             'item_id': {'$arrayElemAt': ['$$item', 0]}
                         }
                     }
@@ -693,7 +699,7 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                 'total_sessions': {'$sum': 1},
                 'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
 
-                # TOTAL ITEMS SHOWN: (Ahora basado en el array procesado)
+                # TOTAL ITEMS SHOWN:
                 'total_items_shown': {'$sum': {
                     '$size': '$history_processed'
                 }},
@@ -724,7 +730,7 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                     }
                 },
 
-                # FINAL RECS GENERATED: (Sigue siendo robusto)
+                # FINAL RECS GENERATED:
                 'final_recs_generated': {
                     '$sum': {
                         '$cond': [
