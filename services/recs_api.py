@@ -666,52 +666,59 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
     # 1. Pipeline de Agregación de MongoDB
     pipeline = [
         {
-            # 1. Filtrar todas las sesiones para el usuario actual
+            # 1. Filtrar las sesiones para el usuario actual
             '$match': {'user_id': user_id}
         },
         {
-            # 2. Agrupar por dominio para calcular las estadísticas de cada uno
+            # 2. Pre-procesar 'history': Convertir el objeto {"$numberInt":"N"} a un entero simple.
+            '$addFields': {
+                'history_processed': {
+                    '$map': {
+                        'input': {'$ifNull': ['$history', []]},
+                        'as': 'item',
+                        'in': {
+                            # 'feedback_value' es ahora el entero simple (0, 1, -1)
+                            'feedback_value': {'$toInt': {'$arrayElemAt': [{'$objectToArray': '$$item.1'}, 0]}.v},
+                            # Mantenemos el ID del ítem
+                            'item_id': {'$arrayElemAt': ['$$item', 0]}
+                        }
+                    }
+                }
+            }
+        },
+        {
+            # 3. Agrupar por dominio para calcular las estadísticas
             '$group': {
                 '_id': '$domain',
                 'total_sessions': {'$sum': 1},
                 'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
 
-                # ITEMS SHOWN: (Sin cambios, sigue siendo robusto)
+                # TOTAL ITEMS SHOWN: (Ahora basado en el array procesado)
                 'total_items_shown': {'$sum': {
-                    '$size': {'$ifNull': ['$history', []]}
+                    '$size': '$history_processed'
                 }},
 
-                # 🎯 ITEMS LIKED: (CORRECCIÓN CON $objectToArray)
+                # ITEMS LIKED: Usamos el campo simple 'feedback_value'
                 'items_liked': {
                     '$sum': {
                         '$size': {
                             '$filter': {
-                                'input': {'$ifNull': ['$history', []]},
+                                'input': '$history_processed',
                                 'as': 'item',
-                                'cond': {
-                                    # Accede al objeto, lo convierte a array, toma el valor 'v' (que es "1"), y lo convierte a entero
-                                    '$eq': [{
-                                        '$toInt': {'$arrayElemAt': [{'$objectToArray': '$$item.1'}, 0]}.v
-                                    }, 1]
-                                }
+                                'cond': {'$eq': ['$$item.feedback_value', 1]}
                             }
                         }
                     }
                 },
 
-                # 🎯 ITEMS REJECTED: (CORRECCIÓN CON $objectToArray)
+                # ITEMS REJECTED:
                 'items_rejected': {
                     '$sum': {
                         '$size': {
                             '$filter': {
-                                'input': {'$ifNull': ['$history', []]},
+                                'input': '$history_processed',
                                 'as': 'item',
-                                'cond': {
-                                    # Accede al objeto, lo convierte a array, toma el valor 'v' (que es "-1"), y lo convierte a entero
-                                    '$eq': [{
-                                        '$toInt': {'$arrayElemAt': [{'$objectToArray': '$$item.1'}, 0]}.v
-                                    }, -1]
-                                }
+                                'cond': {'$eq': ['$$item.feedback_value', -1]}
                             }
                         }
                     }
