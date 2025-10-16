@@ -544,24 +544,32 @@ def build_final_grid(session_id: str,
         rec_item = row_to_recitem(row, distance=0.0)
         final_rec_items.append(rec_item)
 
-        # 2. Obtener el score de calidad para el dashboard
         domain = row.get("domain")
         score = 0.0
-        if domain == "movie":
-            # Normalizamos IMDb (0-10) a 0-5 para consistencia
-            score = float(_col(row, "imdb_score", 0.0)) / 2.0
-        elif domain == "book":
-            # Usamos google_rating (0-5)
-            score = float(_col(row, "google_avg_rating", 0.0))
-        elif domain == "music":
-            # Normalizamos listeners con log10 para que sea comparable (aprox. 0-8)
-            listeners = float(_col(row, "listeners", 1.0))  # Usar 'listeners' de tu items.parquet
-            score = math.log10(listeners + 1)  # +1 para evitar log(0)
-            score = score / 1.6
-            score = min(5.0, score)
-        # 3. Crear el objeto enriquecido para guardar en MongoDB
+        try:  # 👈 Añadimos un bloque try/except para máxima seguridad
+            if domain == "movie":
+                imdb_score = float(_col(row, "imdb_score", 0.0))
+                score = imdb_score / 2.0 if imdb_score else 0.0
+            elif domain == "book":
+                score = float(_col(row, "google_avg_rating", 0.0))
+            elif domain == "music":
+                # ✅ CORRECCIÓN: Asegurarse de que 'listeners' no sea negativo o cero
+                listeners = float(_col(row, "listeners", 1.0))
+                if listeners <= 0:
+                    listeners = 1.0
+                score = math.log10(listeners)  # Ya no necesitamos +1
+                # Normalizamos el score a un rango 0-5
+                score = min(5.0, score / 1.6)
+
+                # ✅ CORRECCIÓN: Asegurarse de que el score final no sea nan/inf
+            if not math.isfinite(score):
+                score = 0.0
+
+        except (ValueError, TypeError):
+            score = 0.0
+
         item_data_for_mongo = rec_item.model_dump()
-        item_data_for_mongo["quality_score"] = round(score, 2)  # Añadimos el score
+        item_data_for_mongo["quality_score"] = round(score, 2)
         final_items_to_save.append(item_data_for_mongo)
         # persistir en la sesión (guardamos la lista con scores)
     sessions_col.update_one(
@@ -598,52 +606,39 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                                     'vars': {'feedback_target': '$$item.1'},
                                     'in': {
                                         '$cond': [
-                                        # 1. Condición A: Es un objeto BSON (antiguo)
-                                        { '$eq': [{ '$type': '$$feedback_target' }, 'object'] },
-
-                                        # 2. THEN (Si es BSON): Lógica para convertir BSON
-                                        { '$toInt': {'$let': {
-                                            'vars': {'feedback_obj': {'$arrayElemAt': [{'$objectToArray': '$$feedback_target'}, 0]}},
-                                            'in': '$$feedback_obj.v'
-                                        }}},
-
-                                        # 3. ELSE (Si no es BSON): ANIDAMOS OTRO $COND
-                                        { '$cond': [
-                                            # a. Condición B: Es Nulo, Array o Indefinido (datos corruptos/viejos)
-                                            { '$in': [{'$type': '$$feedback_target'}, ['array', 'null', 'undefined']] },
-
-                                            # b. THEN (Si es array/nulo): Asumimos feedback 0
-                                            0,
-
-                                            # c. ELSE (El resto): Debe ser un escalar (el valor nuevo)
-                                            { '$toInt': '$$feedback_target' }
-                                        ]}
-                                    ]
+                                            {'$eq': [{'$type': '$$feedback_target'}, 'object']},
+                                            {'$toInt': {'$let': {
+                                                'vars': {'feedback_obj': {
+                                                    '$arrayElemAt': [{'$objectToArray': '$$feedback_target'}, 0]}},
+                                                'in': '$$feedback_obj.v'
+                                            }}},
+                                            {'$cond': [
+                                                {'$in': [{'$type': '$$feedback_target'},
+                                                         ['array', 'null', 'undefined']]},
+                                                0,
+                                                {'$toInt': '$$feedback_target'}
+                                            ]}
+                                        ]
+                                    }
                                 }
-                            }
-                        },
-                        'item_id': {'$arrayElemAt': ['$$item', 0]}
+                            },
+                            'item_id': {'$arrayElemAt': ['$$item', 0]}
                         }
                     }
-                },
-                # --- Cálculo del Promedio de Calidad (por Sesión) ---
+                }
+            }
+        },
+        {
+            '$addFields': {
                 'avg_grid_score': {
-                '$let': {
-                    'vars': {
-                        'total_count': {'$size': '$history_processed'},
-                        # Sumamos solo los likes y dislikes (1 y -1)
-                        'feedback_sum': {'$sum': '$history_processed.feedback_value'}
-                    },
-                    'in': {
-                        '$cond': [
-                            # Si el total de interacciones es 0, evitamos la división
-                            { '$eq': ['$$total_count', 0] },
-                            0, # <--- Si es 0, el promedio es 0 (o puedes usar null si prefieres)
-                            # Si hay interacciones, calculamos el promedio
-                            { '$divide': ['$$feedback_sum', '$$total_count'] }
-                             ]
-                        }
-                    }
+                    '$cond': [
+                        {'$and': [
+                            '$finished',
+                            {'$gt': [{'$size': {'$ifNull': ['$final_grid', []]}}, 0]}
+                        ]},
+                        {'$avg': '$final_grid.quality_score'},
+                        None
+                    ]
                 }
             }
         },
@@ -652,14 +647,12 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                 '_id': '$domain',
                 'total_sessions': {'$sum': 1},
                 'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
-                # APLICAMOS $ifNull a history_processed antes de $size
-                'total_items_shown': {'$sum': {'$size': {'$ifNull': ['$history_processed', []]}}},
+                'total_items_shown': {'$sum': {'$size': '$history_processed'}},
                 'items_liked': {
                     '$sum': {
                         '$size': {
                             '$filter': {
-                                # APLICAMOS $ifNull a history_processed como input para $filter
-                                'input': {'$ifNull': ['$history_processed', []]},
+                                'input': '$history_processed',
                                 'as': 'item',
                                 'cond': {'$eq': ['$$item.feedback_value', 1]}
                             }
@@ -670,15 +663,13 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                     '$sum': {
                         '$size': {
                             '$filter': {
-                                # APLICAMOS $ifNull a history_processed como input para $filter
-                                'input': {'$ifNull': ['$history_processed', []]},
+                                'input': '$history_processed',
                                 'as': 'item',
                                 'cond': {'$eq': ['$$item.feedback_value', -1]}
                             }
                         }
                     }
                 },
-                # Recomendaciones Finales (final_grid ya tiene $ifNull en el código original)
                 'final_recs_generated': {
                     '$sum': {
                         '$cond': [
@@ -694,37 +685,44 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
         }
     ]
     # Ejecutar la pipeline en la colección 'sessions'
+    # Ejecutar la pipeline
     results = list(sessions_col.aggregate(pipeline))
-    # 2. Postprocesamiento en Python
+
+    # 2. Post-procesamiento en Python (CON CORRECCIONES)
     domain_stats_map: Dict[str, DomainStats] = {
         "movie": DomainStats(time_stats=TimeStats()),
         "book": DomainStats(time_stats=TimeStats()),
         "music": DomainStats(time_stats=TimeStats())
     }
+
     total_sum_scores = 0.0
     total_sessions_with_scores = 0
+
     total_stats = {
         'total_sessions': 0, 'finished_sessions': 0, 'total_items_interacted': 0,
         'total_items_liked': 0, 'total_items_rejected': 0, 'total_final_recs_generated': 0,
         'total_hours_interacting': 0.0, 'total_hours_from_final_recs': 0.0
     }
+
     for doc in results:
         domain = doc['_id']
         if domain in domain_stats_map:
-
             hours_interacting = doc.get('total_items_shown', 0) * TIME_ESTIMATES['interaction_seconds']
             hours_from_recs = doc.get('final_recs_generated', 0) * TIME_ESTIMATES.get(domain, 0)
 
-            # Cálculo del promedio de calidad por DOMINIO
-            sum_of_avg_scores = doc.get('sum_of_avg_scores', 0.0) or 0.0
+            sum_of_avg_scores = doc.get('sum_of_avg_scores')
+            if sum_of_avg_scores is None or not math.isfinite(sum_of_avg_scores):
+                sum_of_avg_scores = 0.0
+
             sessions_with_scores = doc.get('sessions_with_scores', 0)
+
             avg_score = 0.0
             if sessions_with_scores > 0:
                 avg_score = sum_of_avg_scores / sessions_with_scores
-            # Acumuladores para el TOTAL global
+
             total_sum_scores += sum_of_avg_scores
             total_sessions_with_scores += sessions_with_scores
-            # Llenar el objeto DomainStats
+
             domain_stats_map[domain] = DomainStats(
                 total_sessions=doc.get('total_sessions', 0),
                 finished_sessions=doc.get('finished_sessions', 0),
@@ -738,8 +736,9 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                     hours_from_final_recs=round(hours_from_recs, 2)
                 )
             )
-    for domain in domain_stats_map:
-        stats = domain_stats_map[domain]
+
+    # 3. Calcular los totales globales
+    for stats in domain_stats_map.values():
         total_stats['total_sessions'] += stats.total_sessions
         total_stats['finished_sessions'] += stats.finished_sessions
         total_stats['total_items_interacted'] += stats.total_items_shown
@@ -748,6 +747,8 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
         total_stats['total_final_recs_generated'] += stats.final_recs_generated
         total_stats['total_hours_interacting'] += stats.time_stats.hours_interacting
         total_stats['total_hours_from_final_recs'] += stats.time_stats.hours_from_final_recs
+
+    # ✅ CORRECCIÓN: Evitar división por cero para el promedio global
     total_avg_quality_score = 0.0
     if total_sessions_with_scores > 0:
         total_avg_quality_score = total_sum_scores / total_sessions_with_scores
