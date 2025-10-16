@@ -598,17 +598,20 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                                     'vars': {'feedback_target': '$$item.1'},
                                     'in': {
                                         '$cond': [
-                                            # Condición A: Es un objeto BSON (formato antiguo: {"$numberInt":"1"})
-                                            {'$eq': [{'$type': '$$feedback_target'}, 'object']},
-                                            # ENTONCES: convertir desde BSON
-                                            {'$toInt': {'$let': {
-                                                'vars': {'feedback_obj': {
-                                                    '$arrayElemAt': [{'$objectToArray': '$$feedback_target'}, 0]}},
-                                                'in': '$$feedback_obj.v'
-                                            }}},
-                                            # Condición B (ELSE): Es un número plano (formato nuevo: 1, -1, 0)
-                                            {'$toInt': '$$feedback_target'}
-                                        ]
+                                        # 1. Condición A: Es un objeto BSON (formato antiguo: {"$numberInt":"1"})
+                                        { '$eq': [{ '$type': '$$feedback_target' }, 'object'] },
+                                        { '$toInt': {'$let': {
+                                            'vars': {'feedback_obj': {'$arrayElemAt': [{'$objectToArray': '$$feedback_target'}, 0]}},
+                                            'in': '$$feedback_obj.v'
+                                        }}},
+
+                                        # 2. Condición B: Manejar Nulos, Arrays o Strings no válidos, devolviendo 0.
+                                        { '$in': [{'$type': '$$feedback_target'}, ['array', 'null', 'undefined']] },
+                                        0,  # <-- Si es un Array, Nulo o Indefinido, asumimos feedback 0
+
+                                        # 3. Condición C (ELSE): Es un valor escalar (número o string de número)
+                                        { '$toInt': '$$feedback_target' }
+                                    ]
                                     }
                                 }
                             },
