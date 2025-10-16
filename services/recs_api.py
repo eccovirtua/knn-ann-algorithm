@@ -693,7 +693,6 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
             }
         }
     ]
-
     # Ejecutar la pipeline en la colección 'sessions'
     results = list(sessions_col.aggregate(pipeline))
     # 2. Postprocesamiento en Python
