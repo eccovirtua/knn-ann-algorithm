@@ -84,27 +84,20 @@ class RecItem(BaseModel):
     title: str
     distance: float
     image_url: Optional[str] = None
-
 class RecommendRequest(BaseModel):
     item_id: str
     top_n: int = 5
-
 class RecommendResponse(BaseModel):
     item_id: str
     recommendations: List[RecItem]
-
 class FeedbackRequest(BaseModel):
     item_id: str
     feedback: int  # -1 rechazo, +1 like, 0 neutro
-
 class SeedResponse(BaseModel):
     seed_item: Optional[RecItem] = None  # permitir None cuando la sesión termina
-
-# Session models
 class SessionCreateResponse(BaseModel):
     session_id: str
     seed: RecItem
-
 class SessionStateResponse(BaseModel):
     session_id: str
     domain: str
@@ -112,61 +105,37 @@ class SessionStateResponse(BaseModel):
     iterations: int
     limit: int
     finished: bool
-
 class FinalListResponse(BaseModel):
     recommendations: List[RecItem]
-
-
-
 class SeedResponseWithSessionId(BaseModel):
     session_id: str
     seed_item: Optional[RecItem] = None
-
-
-
-# --- Modelos ACTUALIZADOS para el Dashboard de Estadísticas ---
-
 class TimeStats(BaseModel):
-    """Modelo para las estadísticas de tiempo estimadas en horas."""
     hours_interacting: float = 0.0
     hours_from_final_recs: float = 0.0
-
-
 class DomainStats(BaseModel):
-    """Estadísticas para un dominio específico (music, book, movie) para el usuario actual."""
     total_sessions: int = 0
     finished_sessions: int = 0
     total_items_shown: int = 0
     items_liked: int = 0
     items_rejected: int = 0
     final_recs_generated: int = 0
+    avg_quality_score: float = 0.0
     time_stats: TimeStats
-
-
 class UserDashboardStats(BaseModel):
-    """Modelo principal para la respuesta del dashboard personal del usuario."""
-    # Métricas Globales (para el usuario actual)
     total_sessions: int
     finished_sessions: int
     total_items_interacted: int
     total_items_liked: int
     total_items_rejected: int
     total_final_recs_generated: int
-
-    # Métricas de Tiempo Globales (para el usuario actual)
+    total_avg_quality_score: float = 0.0
     total_time_stats: TimeStats
-
-    # Desglose por Dominio
     domain_stats: Dict[str, DomainStats]
-
-
-# ---------- Enum de dominios ----------
 class Domain(str, Enum):
     movie = "movie"
     book = "book"
     music = "music"
-
-# ---------- JWT helper ----------
 def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     token = credentials.credentials
     try:
@@ -178,9 +147,7 @@ def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(sec
     except InvalidTokenError:
         raise HTTPException(status_code=401, detail="Token inválido o expirado")
 
-# ---------- util cols ----------
 def _col(df: pd.Series, name: str, default):
-    """Acceso seguro a columnas opcionales del row (Series)."""
     try:
         return df.get(name, default)
     except(ValueError, TypeError):
@@ -195,11 +162,9 @@ def save_feedback(user_id: str, domain: str, item_id: str, feedback: int):
         {"$set": {"feedback": feedback, "ts": now}},
         upsert=True,
     )
-
 def get_history(user_id: str, domain: str) -> List[Tuple[str, int]]:
     docs = feedback_col.find({"user_id": user_id, "domain": domain}).sort("ts", 1)
     return [(d["item_id"], d["feedback"]) for d in docs]
-
 def clear_history(user_id: str, domain: str):
     feedback_col.delete_many({"user_id": user_id, "domain": domain})
 
@@ -210,47 +175,34 @@ CONSIDER_LAST_POSITIVES = 3
 EXPLORATION_SAMPLE = 200
 TARGET_FINAL_N = 20
 DIVERSITY_JACCARD_THRESHOLD = 0.60
-
-# pesos para scoring
 ALPHA_SIM = 0.60    # similitud (desde Annoy / distancia)
 BETA_POP = 0.30     # popularidad / base_score
 GAMMA_IMDB = 0.10
 DELTA_NOVELTY = 0.40
-
-# ---------- utils dominio/genres/popularity ----------
-
 
 def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
     item_id = row.get("item_id") or row.get("itemId")
     if item_id is None:
         print("⚠️ row_to_recitem recibió un row sin item_id válido:", row.to_dict())
     # Omitimos prints de DEBUG si ya verificamos que funcionan
-
     domain = row.get("domain")
     image_url = row.get("image_url") # Leemos la URL del dataset
-
-    # 💥 PASO 1: Invalidar el placeholder si es música
     if domain == "music" and image_url == PLACEHOLDER:
         # Ya verificaste que esta línea se ejecuta y pone la URL a None
         image_url = None
-
     # --- Movies (TMDB) ---
     if domain == "movie" and not image_url:
         title = row.get("title", "")
         clean_title = title.split("(")[0].strip()
-
         try:
             image_url = asyncio.run(fetch_movie_poster(clean_title))
         except RuntimeError:
             loop = asyncio.get_event_loop()
             image_url = loop.run_until_complete(fetch_movie_poster(clean_title))
-
     elif domain == "music" and not image_url:
         artist = row.get("artist", "")
         track = row.get("title", "")
         item_id = row.get("item_id") or row.get("itemId") or ""
-
-        # 🧩 Intentar extraer artista y track desde item_id si no vienen en columnas
         if not artist and item_id.startswith("lf-") and "_" in item_id:
             try:
                 parts = item_id.replace("lf-", "", 1).split("_", 1)
@@ -258,27 +210,21 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
                 track = parts[1].strip()
             except Exception as err:
                 print(f"⚠️ Error extrayendo artista/track desde item_id: {err}")
-
         # 🧩 Fallback: intentar dividir el título por guion
         if not artist and "-" in track:
             parts = track.split("-", 1)
             artist = parts[0].strip()
             track = parts[1].strip()
-
         # 🧩 Consultar imagen del álbum en Last.fm
         if artist and track:
-            # print(f"👉 CALL: Intentando obtener arte para Artista: '{artist}', Track: '{track}'") # Opcional
             try:
                 # 📢 La función get_album_art debe retornar la URL real o None.
                 image_url = get_album_art(artist, track)
             except Exception as err:
                 print(f"⚠️ Error obteniendo imagen de Last.fm: {err}")
                 image_url = None
-
     # --- Fallback general ---
-    # 🌟 PASO 3: Reemplazar el None por el placeholder genérico si la búsqueda falló
     if not image_url:
-        # Usar el placeholder genérico si la búsqueda de la API falló (retorno de get_album_art es None)
         image_url = "https://placehold.co/300x450?text=No+Image"
 
     return RecItem(
@@ -287,7 +233,6 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
         distance=distance,
         image_url=image_url
     )
-
 
 def _genres_to_set(genres):
     """Normaliza la columna genres (lista o string 'a|b')."""
@@ -380,11 +325,6 @@ def compute_next_seed(user_id: str, domain: str) -> Optional[RecItem]:
     return None
 
 def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domain: str) -> Optional[RecItem]:
-    """
-    Nueva lógica de flujo interactivo:
-    - Like: vecinos moderados (70% cercanos, 30% más lejanos).
-    - Dislike: salto fuerte a ítems lejanos.
-    """
     shown = {item for item, _ in session_history}
     if not session_history:
         return None
@@ -407,9 +347,6 @@ def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domai
                 return row_to_recitem(row, distance=0.0)
             # Si no hay absolutamente nada más que mostrar, entonces sí termina.
             return None
-
-
-
         cut = max(1, int(len(candidates) * 0.7))
         close = candidates[:cut]
         far = candidates[cut:]
@@ -439,9 +376,7 @@ def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domai
                 return row_to_recitem(row, distance=0.0)
         return None
 
-# ---------- Fase 2: Filtrado + Boosting + Diversidad ----------
 def _get_quality_score(row: pd.Series) -> float:
-    """Devuelve un score de calidad dependiendo del dominio."""
     domain = row.get("domain")
     if domain == "movie":
         return float(_col(row, "imdb_score", 0.0) or 0.0)
@@ -452,18 +387,13 @@ def _get_quality_score(row: pd.Series) -> float:
     return 0.0
 
 def generate_diverse_recommendations(seen_items: List[str], top_per_domain: int = 5):
-    """
-    Recos simples por dominio con boosting de calidad.
-    """
     df = items_df.copy()
     df = df[~df["itemId"].isin(seen_items)]
     if df.empty:
         return []
-
     df["quality_score"] = df.apply(_get_quality_score, axis=1)
     base_score = df["base_score"] if "base_score" in df.columns else 1.0
     df["boosted_score"] = base_score * (1 + df["quality_score"] / 10.0)
-
     recommendations = []
     for domain, group in df.groupby("domain"):
         top_items = group.nlargest(top_per_domain, "boosted_score")
@@ -473,14 +403,8 @@ def generate_diverse_recommendations(seen_items: List[str], top_per_domain: int 
             )
     return recommendations
 
-# ---------- Fase 3: Pool + Scoring + Diversidad ----------
 def _collect_candidates(domain: str, shown: set, positives: List[str],
                         k_neighbors: int = K_VECINOS, exploration_sample: int = EXPLORATION_SAMPLE) -> dict:
-    """
-    Devuelve un dict item_id -> best_distance (menor) construyendo pool:
-      - vecinos de los últimos positivos,
-      - una muestra de exploración aleatoria del dominio.
-    """
     candidates = {}
     # vecinos de positivos
     for base in positives[-CONSIDER_LAST_POSITIVES:]:
@@ -498,8 +422,6 @@ def _collect_candidates(domain: str, shown: set, positives: List[str],
             prev = candidates.get(cid)
             if prev is None or dist < prev:
                 candidates[cid] = float(dist)
-
-    # exploración aleatoria
     pool = items_df[(items_df["domain"] == domain) & (~items_df["itemId"].isin(shown))]
     if not pool.empty:
         sample = pool.sample(min(exploration_sample, len(pool)))
@@ -508,17 +430,12 @@ def _collect_candidates(domain: str, shown: set, positives: List[str],
             # si no viene de vecinos damos una distancia alta para favorecer exploración
             if cid not in candidates:
                 candidates[cid] = float(999.0)
-
     return candidates
 
 def _score_and_rank_candidates(candidates: dict,
                                alpha_sim: float = ALPHA_SIM,
                                beta_pop: float = BETA_POP,
                                gamma_imdb: float = GAMMA_IMDB) -> List[dict]:
-    """
-    Calcula score combinado y devuelve lista ordenada (desc) de dicts:
-      {item_id, score, dist, genres, row}
-    """
     scored = []
     for cid, dist in candidates.items():
         try:
@@ -546,20 +463,11 @@ def build_final_grid(session_id: str,
                      history: List[Tuple[str, int]],
                      target_n: int = TARGET_FINAL_N,
                      diversity_threshold: float = DIVERSITY_JACCARD_THRESHOLD) -> List[RecItem]:
-    """
-    Construye el grid final (20 items) con mezcla:
-      - vecinos desde likes (scoring + diversidad)
-      - hidden gems: alto rating, baja popularidad
-      - underdogs: bajo rating_count
-    Reglas: todos del dominio, mezcla balanceada y orden final randomizado.
-    """
     shown = {iid for iid, _ in history}
     positives = [iid for iid, fb in history if fb > 0]
-
     # --- 1) pool + scoring desde likes ---
     candidates = _collect_candidates(domain, shown, positives)
     scored = _score_and_rank_candidates(candidates)
-
     # greedy con diversidad (tomamos hasta 12 de aquí)
     picked_from_scored: List[str] = []
     selected_genres = []
@@ -582,43 +490,34 @@ def build_final_grid(session_id: str,
     dom_df = items_df[(items_df["domain"] == domain) & (~items_df["itemId"].isin(shown))]
     if dom_df.empty:
         dom_df = items_df[items_df["domain"] == domain]
-
     # heurísticas robustas
     dom_df = dom_df.copy()
     dom_df["__rating"] = dom_df.apply(_rating, axis=1)
     dom_df["__pop"] = dom_df.apply(_get_popularity, axis=1)
     dom_df["__rc"] = dom_df.apply(_rating_count, axis=1)
-
     # thresholds dinámicos
     pop_q20 = float(dom_df["__pop"].quantile(0.20)) if len(dom_df) > 0 else 0.0
     rating_q75 = float(dom_df["__rating"].quantile(0.75)) if len(dom_df) > 0 else 4.0
-
     hidden_mask = (dom_df["__rating"] >= rating_q75) & (dom_df["__pop"] <= pop_q20)
     hidden_df = dom_df[hidden_mask]
     hidden_ids = hidden_df["itemId"].tolist()
     random.shuffle(hidden_ids)
     hidden_ids = hidden_ids[:4]  # 4 hidden gems
-
-    # --- 3) underdogs (bajo rating_count pero no basura) ---
     rc_q25 = int(dom_df["__rc"].quantile(0.25)) if len(dom_df) > 0 else 10
-    # mantener calidad aceptable
     und_mask = (dom_df["__rc"] <= max(5, rc_q25)) & (dom_df["__rating"] >= (rating_q75 * 0.75))
     und_df = dom_df[und_mask]
     underdog_ids = und_df["itemId"].tolist()
     random.shuffle(underdog_ids)
-    underdog_ids = underdog_ids[:4]  # 4 underdogs
-
+    underdog_ids = underdog_ids[:4]
     # --- 4) combinar y rellenar ---
     combined_ids = []
     def _safe_extend(ids):
         for iid in ids:
             if iid not in combined_ids and iid not in shown:
                 combined_ids.append(iid)
-
     _safe_extend(picked_from_scored)
     _safe_extend(hidden_ids)
     _safe_extend(underdog_ids)
-
     # si faltan, rellenar con resto del dominio evitando repetidos y manteniendo diversidad suave
     if len(combined_ids) < target_n:
         need = target_n - len(combined_ids)
@@ -630,34 +529,49 @@ def build_final_grid(session_id: str,
             remaining_pool.extend(extra_dom)
         remaining_pool = remaining_pool[:need]
         _safe_extend(remaining_pool)
-
     # recortar y randomizar orden final
     final_ids = combined_ids[:target_n]
     random.shuffle(final_ids)
 
-    # mapear a RecItem
-    final_items: List[RecItem] = []
+    final_items_to_save = []
+    final_rec_items = []
     for iid in final_ids:
         try:
             row = items_df.loc[movieid_to_index[iid]]
         except (ValueError, TypeError):
-            # fallback por index basado en filtro
             row = items_df[items_df["itemId"] == iid].iloc[0]
-        final_items.append(
-            row_to_recitem(row, distance=0.0)
-        )
+        # 1. Crear el RecItem estándar para la respuesta de la API
+        rec_item = row_to_recitem(row, distance=0.0)
+        final_rec_items.append(rec_item)
 
-    # persistir en la sesión
+        # 2. Obtener el score de calidad para el dashboard
+        domain = row.get("domain")
+        score = 0.0
+        if domain == "movie":
+            # Normalizamos IMDb (0-10) a 0-5 para consistencia
+            score = float(_col(row, "imdb_score", 0.0)) / 2.0
+        elif domain == "book":
+            # Usamos google_rating (0-5)
+            score = float(_col(row, "google_avg_rating", 0.0))
+        elif domain == "music":
+            # Normalizamos listeners con log10 para que sea comparable (aprox. 0-8)
+            listeners = float(_col(row, "listeners", 1.0))  # Usar 'listeners' de tu items.parquet
+            score = math.log10(listeners + 1)  # +1 para evitar log(0)
+            score = score / 1.6
+            score = min(5.0, score)
+        # 3. Crear el objeto enriquecido para guardar en MongoDB
+        item_data_for_mongo = rec_item.model_dump()
+        item_data_for_mongo["quality_score"] = round(score, 2)  # Añadimos el score
+        final_items_to_save.append(item_data_for_mongo)
+        # persistir en la sesión (guardamos la lista con scores)
     sessions_col.update_one(
         {"session_id": session_id},
-        {"$set": {"final_grid": [i.model_dump() for i in final_items]}}
+        {"$set": {"final_grid": final_items_to_save}}  # 👈 Guardamos la lista enriquecida
     )
-
     logger.info("build_final_grid user=%s session=%s domain=%s -> %d items (likes=%d, hidden=%d, underdogs=%d)",
-                user_id, session_id, domain, len(final_items), len(positives), len(hidden_ids), len(underdog_ids))
-    return final_items
-
-
+                user_id, session_id, domain, len(final_rec_items), len(positives), len(hidden_ids), len(underdog_ids))
+    # Devolvemos la lista original de RecItems (sin el score) a la app
+    return final_rec_items
 # Constantes para estimación de tiempo en HORAS
 TIME_ESTIMATES = {
     "movie": 1.75,  # 1 h 45 m en promedio por película
@@ -666,59 +580,34 @@ TIME_ESTIMATES = {
     "interaction_seconds": 30 / 3600  # 30 segundos por interacción, convertido a horas
 }
 
-
 def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
-    """
-    Calcula las estadísticas del dashboard para un usuario específico usando un
-    pipeline de agregación de MongoDB.
-    """
-
     # 1. Pipeline de Agregación de MongoDB
     pipeline = [
         {
-            # 1. Filtrar las sesiones para el usuario actual
             '$match': {'user_id': user_id}
         },
         {
-            # 2. Pre-procesar 'history': Convierte el objeto BSON de feedback a un entero.
             '$addFields': {
                 'history_processed': {
                     '$map': {
                         'input': {'$ifNull': ['$history', []]},
                         'as': 'item',
                         'in': {
-                            # Usa $let para definir variables internas y $cond para seguridad.
                             'feedback_value': {
                                 '$let': {
-                                    'vars': {
-                                        'feedback_target': '$$item.1'
-                                    },
+                                    'vars': {'feedback_target': '$$item.1'},
                                     'in': {
                                         '$cond': [
-                                            # Condición: Solo si el campo es un 'object' (tipo BSON 3)
+                                            # Condición A: Es un objeto BSON (formato antiguo: {"$numberInt":"1"})
                                             {'$eq': [{'$type': '$$feedback_target'}, 'object']},
-
-                                            # Si es 'object': Realiza la conversión segura
-                                            {
-                                                '$toInt': {
-                                                    '$let': {
-                                                        'vars': {
-                                                            # feedback_obj es el array [{k: "$numberInt", v: "N"}]
-                                                            'feedback_obj': {
-                                                                '$arrayElemAt': [
-                                                                    {'$objectToArray': '$$feedback_target'},
-                                                                    0
-                                                                ]
-                                                            }
-                                                        },
-                                                        # Accede al valor 'v' (el número como string)
-                                                        'in': '$$feedback_obj.v'
-                                                    }
-                                                }
-                                            },
-
-                                            # Si NO es 'object': Asumimos 0 (o el valor por defecto que desees)
-                                            0
+                                            # ENTONCES: convertir desde BSON
+                                            {'$toInt': {'$let': {
+                                                'vars': {'feedback_obj': {
+                                                    '$arrayElemAt': [{'$objectToArray': '$$feedback_target'}, 0]}},
+                                                'in': '$$feedback_obj.v'
+                                            }}},
+                                            # Condición B (ELSE): Es un número plano (formato nuevo: 1, -1, 0)
+                                            {'$toInt': '$$feedback_target'}
                                         ]
                                     }
                                 }
@@ -727,22 +616,27 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                             'item_id': {'$arrayElemAt': ['$$item', 0]}
                         }
                     }
+                },
+                # --- Cálculo del Promedio de Calidad (por Sesión) ---
+                'avg_grid_score': {
+                    '$cond': [
+                        {'$and': [
+                            '$finished',
+                            {'$gt': [{'$size': {'$ifNull': ['$final_grid', []]}}, 0]}
+                        ]},
+                        # Calcula el promedio del campo 'quality_score' dentro del array 'final_grid'
+                        {'$avg': '$final_grid.quality_score'},
+                        None  # Si no está finalizada o el grid está vacío, el score es nulo
+                    ]
                 }
             }
         },
         {
-            # 3. Agrupar por dominio y calcular las estadísticas
             '$group': {
                 '_id': '$domain',
                 'total_sessions': {'$sum': 1},
                 'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
-
-                # TOTAL ITEMS SHOWN: (Basado en el array ya procesado)
-                'total_items_shown': {'$sum': {
-                    '$size': '$history_processed'
-                }},
-
-                # ITEMS LIKED: Filtra por el campo entero feedback_value = 1
+                'total_items_shown': {'$sum': {'$size': '$history_processed'}},
                 'items_liked': {
                     '$sum': {
                         '$size': {
@@ -754,8 +648,6 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                         }
                     }
                 },
-
-                # ITEMS REJECTED: Filtra por el campo entero feedback_value = -1
                 'items_rejected': {
                     '$sum': {
                         '$size': {
@@ -767,8 +659,7 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                         }
                     }
                 },
-
-                # FINAL RECS GENERATED: (Sigue siendo robusto)
+                # Recomendaciones Finales
                 'final_recs_generated': {
                     '$sum': {
                         '$cond': [
@@ -777,30 +668,44 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                             0
                         ]
                     }
-                }
+                },
+                'sum_of_avg_scores': {'$sum': '$avg_grid_score'},
+                'sessions_with_scores': {'$sum': {'$cond': ['$avg_grid_score', 1, 0]}}
             }
         }
     ]
 
     # Ejecutar la pipeline en la colección 'sessions'
     results = list(sessions_col.aggregate(pipeline))
-
     # 2. Postprocesamiento en Python
     domain_stats_map: Dict[str, DomainStats] = {
         "movie": DomainStats(time_stats=TimeStats()),
         "book": DomainStats(time_stats=TimeStats()),
         "music": DomainStats(time_stats=TimeStats())
     }
-
+    total_sum_scores = 0.0
+    total_sessions_with_scores = 0
+    total_stats = {
+        'total_sessions': 0, 'finished_sessions': 0, 'total_items_interacted': 0,
+        'total_items_liked': 0, 'total_items_rejected': 0, 'total_final_recs_generated': 0,
+        'total_hours_interacting': 0.0, 'total_hours_from_final_recs': 0.0
+    }
     for doc in results:
         domain = doc['_id']
         if domain in domain_stats_map:
-            # Calcular tiempo de interacción
-            hours_interacting = doc['total_items_shown'] * TIME_ESTIMATES['interaction_seconds']
 
-            # Calcular tiempo de consumo de recomendaciones finales
-            hours_from_recs = doc['final_recs_generated'] * TIME_ESTIMATES.get(domain, 0)
+            hours_interacting = doc.get('total_items_shown', 0) * TIME_ESTIMATES['interaction_seconds']
+            hours_from_recs = doc.get('final_recs_generated', 0) * TIME_ESTIMATES.get(domain, 0)
 
+            # Cálculo del promedio de calidad por DOMINIO
+            sum_of_avg_scores = doc.get('sum_of_avg_scores', 0.0) or 0.0
+            sessions_with_scores = doc.get('sessions_with_scores', 0)
+            avg_score = 0.0
+            if sessions_with_scores > 0:
+                avg_score = sum_of_avg_scores / sessions_with_scores
+            # Acumuladores para el TOTAL global
+            total_sum_scores += sum_of_avg_scores
+            total_sessions_with_scores += sessions_with_scores
             # Llenar el objeto DomainStats
             domain_stats_map[domain] = DomainStats(
                 total_sessions=doc.get('total_sessions', 0),
@@ -809,24 +714,12 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                 items_liked=doc.get('items_liked', 0),
                 items_rejected=doc.get('items_rejected', 0),
                 final_recs_generated=doc.get('final_recs_generated', 0),
+                avg_quality_score=round(avg_score, 2),
                 time_stats=TimeStats(
                     hours_interacting=round(hours_interacting, 2),
                     hours_from_final_recs=round(hours_from_recs, 2)
                 )
             )
-
-    # 3. Calcular los totales globales sumando las estadísticas de cada dominio
-    total_stats = {
-        'total_sessions': 0,
-        'finished_sessions': 0,
-        'total_items_interacted': 0,
-        'total_items_liked': 0,
-        'total_items_rejected': 0,
-        'total_final_recs_generated': 0,
-        'total_hours_interacting': 0.0,
-        'total_hours_from_final_recs': 0.0
-    }
-
     for domain in domain_stats_map:
         stats = domain_stats_map[domain]
         total_stats['total_sessions'] += stats.total_sessions
@@ -837,6 +730,9 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
         total_stats['total_final_recs_generated'] += stats.final_recs_generated
         total_stats['total_hours_interacting'] += stats.time_stats.hours_interacting
         total_stats['total_hours_from_final_recs'] += stats.time_stats.hours_from_final_recs
+    total_avg_quality_score = 0.0
+    if total_sessions_with_scores > 0:
+        total_avg_quality_score = total_sum_scores / total_sessions_with_scores
 
     return UserDashboardStats(
         total_sessions=total_stats['total_sessions'],
@@ -845,69 +741,16 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
         total_items_liked=total_stats['total_items_liked'],
         total_items_rejected=total_stats['total_items_rejected'],
         total_final_recs_generated=total_stats['total_final_recs_generated'],
+        total_avg_quality_score=round(total_avg_quality_score, 2),
         total_time_stats=TimeStats(
             hours_interacting=round(total_stats['total_hours_interacting'], 2),
             hours_from_final_recs=round(total_stats['total_hours_from_final_recs'], 2)
         ),
         domain_stats=domain_stats_map
     )
-
-# --- Endpoint para el Dashboard ---
 @app.get("/stats/dashboard", response_model=UserDashboardStats)
 def api_get_user_dashboard_stats(user_id: str = Depends(get_user_id_from_jwt)):
-    """
-    Endpoint para obtener las estadísticas del dashboard personal de un usuario.
-    """
     return get_user_dashboard_stats(user_id)
-# ---------- Endpoints: legacy recommend + seed + feedback + reset ----------
-@app.post("/recommend", response_model=RecommendResponse)
-def recommend(req: RecommendRequest):
-    if req.item_id not in movieid_to_index:
-        raise HTTPException(404, f"item_id '{req.item_id}' no encontrado")
-    idx = movieid_to_index[req.item_id]
-    neigh_idxs, dists = ann_index.get_nns_by_item(idx, req.top_n + 1, include_distances=True)
-    recs = []
-    for n_idx, dist in zip(neigh_idxs[1:], dists[1:]):
-        row = items_df.iloc[n_idx]
-        recs.append(row_to_recitem(row, distance=0.0))
-    return RecommendResponse(item_id=req.item_id, recommendations=recs)
-
-@app.post("/recommend/diverse")
-def recommend_diverse(user_id: str = Depends(get_user_id_from_jwt)):
-    seen_items: List[str] = []
-    for dom in ["movie", "book", "music"]:
-        seen_items.extend([item_id for item_id, _ in get_history(user_id, dom)])
-
-    recs = generate_diverse_recommendations(seen_items, top_per_domain=5)
-    return {"user_id": user_id, "recommendations": [r.model_dump() for r in recs]}
-
-@app.get("/seed/{domain}", response_model=SeedResponse)
-def get_initial_seed(domain: Domain, user_id: str = Depends(get_user_id_from_jwt)):
-    dom = domain.value
-    history = get_history(user_id, dom)
-    if history:
-        last_item_id, _ = history[-1]
-        if last_item_id in movieid_to_index:
-            row = items_df.loc[movieid_to_index[last_item_id]]
-            return row_to_recitem(row, distance=0.0)
-        else:
-            clear_history(user_id, dom)
-    seed = generate_new_seed(dom)
-    save_feedback(user_id, dom, seed.item_id, 0)
-    return SeedResponse(seed_item=seed)
-
-@app.post("/feedback/{domain}", response_model=SeedResponse)
-def handle_feedback(domain: Domain, req: FeedbackRequest, user_id: str = Depends(get_user_id_from_jwt)):
-    dom = domain.value
-    save_feedback(user_id, dom, req.item_id, req.feedback)
-    new_seed = compute_next_seed(user_id, dom)
-    if new_seed is None:
-        raise HTTPException(404, "No se pudo generar nuevo ítem semilla")
-    last = feedback_col.find_one({"user_id": user_id, "domain": dom}, sort=[("ts", -1)])
-    if not last or last.get("item_id") != new_seed.item_id:
-        save_feedback(user_id, dom, new_seed.item_id, 0)
-    return SeedResponse(seed_item=new_seed)
-
 
 # ---------- Session endpoints (nuevo flujo) ----------
 def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
@@ -926,49 +769,36 @@ def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
         "history": [(seed.item_id, 0)],  # guardamos la seed inicial como neutral
         "shown": [seed.item_id]
     })
-    # (legado) guardado en colección paralela — no se usa como fuente
     session_feedback_col.insert_one({"session_id": session_id, "item_id": seed.item_id, "feedback": 0, "ts": now})
     return session_id, seed
-
-
 @app.get("/user/final-grid/{domain}", response_model=FinalListResponse)
 def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_user_id_from_jwt)):
-    """
-    Devuelve el grid final existente para un usuario y dominio
-    """
     # Buscar la última sesión finalizada del usuario en ese dominio
     session = db.sessions.find_one(
         {"user_id": user_id, "domain": domain, "finished": True},
         sort=[("created_at", -1)]
     )
-
     if not session or "final_grid" not in session:
         raise HTTPException(404, "No hay grid final para este usuario y dominio")
-
     recs = [RecItem(**item) for item in session["final_grid"]]
     return FinalListResponse(recommendations=recs)
 
 def get_session(session_id: str):
     return sessions_col.find_one({"session_id": session_id})
 
-
 def get_session_history(session_id: str) -> List[Tuple[str, int]]:
     s = get_session(session_id)
     if not s:
         return []
-
     history = []
     for x in s.get("history", []):
-        # forzar tipo: primer elemento str, segundo int
         try:
             item_id = str(x[0])
             feedback = int(x[1])
             history.append((item_id, feedback))
         except (IndexError, ValueError, TypeError):
             continue  # saltar elementos corruptos
-
     return history
-
 def reset_session(session_id: str):
     sessions_col.update_one({"session_id": session_id}, {"$set": {
         "iterations": 0,
@@ -1012,7 +842,6 @@ def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = D
     s = get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
-
     domain = s["domain"]
     history = s.get("history", [])
     shown: List[str] = list(s.get("shown", []))
@@ -1024,17 +853,12 @@ def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = D
     row = items_df.loc[movieid_to_index[req.item_id]]
     if str(row["domain"]) != domain:
         raise HTTPException(400, "El item no corresponde al dominio de la sesión")
-
-    # guardar feedback (evitar duplicar si ya estaba como seed 0)
     if not history or history[-1][0] != req.item_id or history[-1][1] != req.feedback:
         history.append((req.item_id, req.feedback))
     if not shown or shown[-1] != req.item_id:
         shown.append(req.item_id)
-
     iterations = len(shown)  # 1 ítem mostrado == 1 iteración
     finished = iterations >= limit
-
-    # si ya terminó, actualizar y devolver seed_item=None
     if finished:
         sessions_col.update_one(
             {"session_id": session_id},
@@ -1044,7 +868,6 @@ def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = D
             }}
         )
         return SeedResponse(seed_item=None)
-
     # si no terminó, calcular siguiente seed
     new_seed = compute_next_seed_from_history(history, domain)
     if not new_seed:
@@ -1054,8 +877,6 @@ def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = D
             {"$set": {"history": history, "shown": shown, "iterations": iterations, "finished": True}}
         )
         return SeedResponse(seed_item=None)
-
-    # persistir estado + last_item_id
     sessions_col.update_one(
         {"session_id": session_id},
         {"$set": {
@@ -1063,9 +884,7 @@ def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = D
             "last_item_id": new_seed.item_id, "finished": False
         }}
     )
-    # (legado) colección paralela
     session_feedback_col.insert_one({"session_id": session_id, "item_id": req.item_id, "feedback": req.feedback, "ts": datetime.now(timezone.utc)})
-
     return SeedResponse(seed_item=new_seed)
 
 @app.post("/session/{session_id}/reset", response_model=SeedResponseWithSessionId)
@@ -1073,16 +892,12 @@ def api_session_reset(session_id: str, user_id: str = Depends(get_user_id_from_j
     s = get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
-
     # Generar un nuevo session_id
     new_session_id = str(uuid4())
-
     # Reiniciar la sesión antigua en DB
     reset_session(session_id)
-
     # Generar seed para la nueva sesión
     seed = generate_new_seed(s["domain"])
-
     # Insertar nueva sesión en la DB con el nuevo session_id
     sessions_col.insert_one({
         "session_id": new_session_id,
@@ -1096,15 +911,12 @@ def api_session_reset(session_id: str, user_id: str = Depends(get_user_id_from_j
         "last_item_id": seed.item_id,
         "created_at": datetime.now(timezone.utc)
     })
-
-    # Insertar feedback inicial
     session_feedback_col.insert_one({
         "session_id": new_session_id,
         "item_id": seed.item_id,
         "feedback": 0,
         "ts": datetime.now(timezone.utc)
     })
-
     return SeedResponseWithSessionId(session_id=new_session_id, seed_item=seed)
 
 @app.get("/session/{session_id}/final-grid", response_model=FinalListResponse)
@@ -1112,16 +924,11 @@ def api_get_final_grid(session_id: str, user_id: str = Depends(get_user_id_from_
     s = get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
-
-    # si aún no terminó, bloquear
     if not bool(s.get("finished", False)) and int(s.get("iterations", 0)) < int(s.get("limit", SESSION_ITER_LIMIT)):
         raise HTTPException(400, "Session not finished yet")
-
     # si ya existe final_grid → devolverlo
     if "final_grid" in s and s["final_grid"]:
         return FinalListResponse(recommendations=[RecItem(**i) for i in s["final_grid"]])
-
-    # construir y persistir
     final_items = build_final_grid(
         session_id=session_id,
         user_id=user_id,
@@ -1134,23 +941,14 @@ def api_get_final_grid(session_id: str, user_id: str = Depends(get_user_id_from_
 
 @app.post("/session/{session_id}/finalize", response_model=FinalListResponse)
 def api_session_finalize(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    """
-    Forzar que la sesión quede finalizada y devolver/crear el final grid,
-    aunque no haya iteraciones todavía.
-    """
     s = get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
-
-    # marcar como finished siempre
     sessions_col.update_one(
         {"session_id": session_id},
         {"$set": {"finished": True}}
     )
-
-    # devolver el grid final (lo crea si no existe)
     return api_get_final_grid(session_id, user_id)
-
 @app.get("/health")
 def health():
     return {"status": "ok"}
