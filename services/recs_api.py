@@ -628,15 +628,22 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                 },
                 # --- Cálculo del Promedio de Calidad (por Sesión) ---
                 'avg_grid_score': {
-                    '$cond': [
-                        {'$and': [
-                            '$finished',
-                            {'$gt': [{'$size': {'$ifNull': ['$final_grid', []]}}, 0]}
-                        ]},
-                        # Calcula el promedio del campo 'quality_score' dentro del array 'final_grid'
-                        {'$avg': '$final_grid.quality_score'},
-                        None  # Si no está finalizada o el grid está vacío, el score es nulo
-                    ]
+                '$let': {
+                    'vars': {
+                        'total_count': {'$size': '$history_processed'},
+                        # Sumamos solo los likes y dislikes (1 y -1)
+                        'feedback_sum': {'$sum': '$history_processed.feedback_value'}
+                    },
+                    'in': {
+                        '$cond': [
+                            # Si el total de interacciones es 0, evitamos la división
+                            { '$eq': ['$$total_count', 0] },
+                            0, # <--- Si es 0, el promedio es 0 (o puedes usar null si prefieres)
+                            # Si hay interacciones, calculamos el promedio
+                            { '$divide': ['$$feedback_sum', '$$total_count'] }
+                             ]
+                        }
+                    }
                 }
             }
         },
