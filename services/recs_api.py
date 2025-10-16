@@ -598,25 +598,31 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                                     'vars': {'feedback_target': '$$item.1'},
                                     'in': {
                                         '$cond': [
-                                        # 1. Condición A: Es un objeto BSON (formato antiguo: {"$numberInt":"1"})
+                                        # 1. Condición A: Es un objeto BSON (antiguo)
                                         { '$eq': [{ '$type': '$$feedback_target' }, 'object'] },
+
+                                        # 2. THEN (Si es BSON): Lógica para convertir BSON
                                         { '$toInt': {'$let': {
                                             'vars': {'feedback_obj': {'$arrayElemAt': [{'$objectToArray': '$$feedback_target'}, 0]}},
                                             'in': '$$feedback_obj.v'
                                         }}},
 
-                                        # 2. Condición B: Manejar Nulos, Arrays o Strings no válidos, devolviendo 0.
-                                        { '$in': [{'$type': '$$feedback_target'}, ['array', 'null', 'undefined']] },
-                                        0,  # <-- Si es un Array, Nulo o Indefinido, asumimos feedback 0
+                                        # 3. ELSE (Si no es BSON): ANIDAMOS OTRO $COND
+                                        { '$cond': [
+                                            # a. Condición B: Es Nulo, Array o Indefinido (datos corruptos/viejos)
+                                            { '$in': [{'$type': '$$feedback_target'}, ['array', 'null', 'undefined']] },
 
-                                        # 3. Condición C (ELSE): Es un valor escalar (número o string de número)
-                                        { '$toInt': '$$feedback_target' }
+                                            # b. THEN (Si es array/nulo): Asumimos feedback 0
+                                            0,
+
+                                            # c. ELSE (El resto): Debe ser un escalar (el valor nuevo)
+                                            { '$toInt': '$$feedback_target' }
+                                        ]}
                                     ]
-                                    }
                                 }
-                            },
-                            # Mantenemos el ID del ítem
-                            'item_id': {'$arrayElemAt': ['$$item', 0]}
+                            }
+                        },
+                        'item_id': {'$arrayElemAt': ['$$item', 0]}
                         }
                     }
                 },
