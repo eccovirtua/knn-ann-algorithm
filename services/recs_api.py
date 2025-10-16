@@ -398,8 +398,18 @@ def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domai
         neigh_idxs, dists = ann_index.get_nns_by_item(idx, 30, include_distances=True)
         candidates = [(n_idx, d) for n_idx, d in zip(neigh_idxs[1:], dists[1:]) if items_df.iloc[n_idx]["domain"] == domain]
         candidates = [(n_idx, d) for n_idx, d in candidates if items_df.iloc[n_idx]["itemId"] not in shown]
+
         if not candidates:
+            # Fallback: Busca un ítem aleatorio del dominio que no se haya mostrado
+            fallback_candidates = items_df[(items_df["domain"] == domain) & (~items_df["itemId"].isin(shown))]
+            if not fallback_candidates.empty:
+                row = fallback_candidates.sample(1).iloc[0]
+                return row_to_recitem(row, distance=0.0)
+            # Si no hay absolutamente nada más que mostrar, entonces sí termina.
             return None
+
+
+
         cut = max(1, int(len(candidates) * 0.7))
         close = candidates[:cut]
         far = candidates[cut:]
