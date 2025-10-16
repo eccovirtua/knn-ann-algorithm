@@ -643,16 +643,18 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
             }
         },
         {
+
             '$group': {
                 '_id': '$domain',
                 'total_sessions': {'$sum': 1},
                 'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
-                'total_items_shown': {'$sum': {'$size': '$history_processed'}},
+                'total_items_shown': {'$sum': {'$size': {'$ifNull': ['$history_processed', []]}}},
+
                 'items_liked': {
                     '$sum': {
                         '$size': {
                             '$filter': {
-                                'input': '$history_processed',
+                                'input': {'$ifNull': ['$history_processed', []]},
                                 'as': 'item',
                                 'cond': {'$eq': ['$$item.feedback_value', 1]}
                             }
@@ -663,7 +665,7 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                     '$sum': {
                         '$size': {
                             '$filter': {
-                                'input': '$history_processed',
+                                'input': {'$ifNull': ['$history_processed', []]},
                                 'as': 'item',
                                 'cond': {'$eq': ['$$item.feedback_value', -1]}
                             }
@@ -684,11 +686,7 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
             }
         }
     ]
-    # Ejecutar la pipeline en la colección 'sessions'
-    # Ejecutar la pipeline
     results = list(sessions_col.aggregate(pipeline))
-
-    # 2. Post-procesamiento en Python (CON CORRECCIONES)
     domain_stats_map: Dict[str, DomainStats] = {
         "movie": DomainStats(time_stats=TimeStats()),
         "book": DomainStats(time_stats=TimeStats()),
