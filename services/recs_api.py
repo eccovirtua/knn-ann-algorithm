@@ -652,12 +652,14 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                 '_id': '$domain',
                 'total_sessions': {'$sum': 1},
                 'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
-                'total_items_shown': {'$sum': {'$size': '$history_processed'}},
+                # APLICAMOS $ifNull a history_processed antes de $size
+                'total_items_shown': {'$sum': {'$size': {'$ifNull': ['$history_processed', []]}}},
                 'items_liked': {
                     '$sum': {
                         '$size': {
                             '$filter': {
-                                'input': '$history_processed',
+                                # APLICAMOS $ifNull a history_processed como input para $filter
+                                'input': {'$ifNull': ['$history_processed', []]},
                                 'as': 'item',
                                 'cond': {'$eq': ['$$item.feedback_value', 1]}
                             }
@@ -668,14 +670,15 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                     '$sum': {
                         '$size': {
                             '$filter': {
-                                'input': '$history_processed',
+                                # APLICAMOS $ifNull a history_processed como input para $filter
+                                'input': {'$ifNull': ['$history_processed', []]},
                                 'as': 'item',
                                 'cond': {'$eq': ['$$item.feedback_value', -1]}
                             }
                         }
                     }
                 },
-                # Recomendaciones Finales
+                # Recomendaciones Finales (final_grid ya tiene $ifNull en el código original)
                 'final_recs_generated': {
                     '$sum': {
                         '$cond': [
