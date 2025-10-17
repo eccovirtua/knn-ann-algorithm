@@ -535,37 +535,56 @@ def build_final_grid(session_id: str,
 
     final_items_to_save = []
     final_rec_items = []
+
+    # Prepara el DataFrame para buscar solo los ítems necesarios
+    final_ids_set = set(final_ids)
+
+    # 1. Obtener todas las filas de ítems de una sola vez (más eficiente)
+    # Asumimos que la columna de IDs es "itemId"
+    final_items_df = items_df[items_df["itemId"].isin(final_ids_set)]
+
     for iid in final_ids:
         try:
-            row = items_df.loc[movieid_to_index[iid]]
-        except (ValueError, TypeError):
-            row = items_df[items_df["itemId"] == iid].iloc[0]
-        # 1. Crear el RecItem estándar para la respuesta de la API
+            # Aseguramos que 'row' es la Serie de Pandas correspondiente al ítem
+            row = final_items_df[final_items_df["itemId"] == iid].iloc[0]
+
+        except IndexError:
+            # Esto maneja el caso de que el ID no se encuentre en el DataFrame
+            logger.warning(f"Item ID {iid} not found in items_df during final grid build.")
+            continue  # Saltar este ítem si no se encuentra
+
+        # Utilizamos la función row_to_recitem y el model_dump
         rec_item = row_to_recitem(row, distance=0.0)
         final_rec_items.append(rec_item)
 
-        domain = row.get("domain")
+        domain = row["domain"]  # Acceso seguro a la Serie de Pandas
         score = 0.0
-        try:  # 👈 Añadimos un bloque try/except para máxima seguridad
+
+        try:
             if domain == "movie":
+                # ✅ CORRECCIÓN: Usa row["campo"] si _col no funciona con Series de Pandas.
+                # Asumiendo que _col funciona con Series:
                 imdb_score = float(_col(row, "imdb_score", 0.0))
+
+                # Esto está correcto, pero si imdb_score es 0.0, score será 0.0
                 score = imdb_score / 2.0 if imdb_score else 0.0
+
             elif domain == "book":
                 score = float(_col(row, "google_avg_rating", 0.0))
+
             elif domain == "music":
-                # ✅ CORRECCIÓN: Asegurarse de que 'listeners' no sea negativo o cero
                 listeners = float(_col(row, "listeners", 1.0))
                 if listeners <= 0:
                     listeners = 1.0
-                score = math.log10(listeners)  # Ya no necesitamos +1
-                # Normalizamos el score a un rango 0-5
+                score = math.log10(listeners)
                 score = min(5.0, score / 1.6)
 
-                # ✅ CORRECCIÓN: Asegurarse de que el score final no sea nan/inf
             if not math.isfinite(score):
                 score = 0.0
 
-        except (ValueError, TypeError):
+        except Exception as score_e:
+            # Captura cualquier error de conversión o cálculo y lo establece a 0.0
+            logger.error(f"Error calculating score for {iid} in {domain}: {score_e}")
             score = 0.0
 
         item_data_for_mongo = rec_item.model_dump()
@@ -574,7 +593,7 @@ def build_final_grid(session_id: str,
         # persistir en la sesión (guardamos la lista con scores)
     sessions_col.update_one(
         {"session_id": session_id},
-        {"$set": {"final_grid": final_items_to_save}}  # 👈 Guardamos la lista enriquecida
+        {"$set": {"final_grid": final_items_to_save}}
     )
     logger.info("build_final_grid user=%s session=%s domain=%s -> %d items (likes=%d, hidden=%d, underdogs=%d)",
                 user_id, session_id, domain, len(final_rec_items), len(positives), len(hidden_ids), len(underdog_ids))
