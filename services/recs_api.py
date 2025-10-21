@@ -456,7 +456,6 @@ def _score_and_rank_candidates(candidates: dict,
     scored.sort(key=lambda x: x["score"], reverse=True)
     return scored
 
-# ---------- Final Grid Builder (mezcla + randomización) ----------
 def build_final_grid(session_id: str,
                      user_id: str,
                      domain: str,
@@ -562,20 +561,27 @@ def build_final_grid(session_id: str,
 
         try:
             if domain == "movie":
-                # ✅ CORRECCIÓN: Usa row["campo"] si _col no funciona con Series de Pandas.
-                # Asumiendo que _col funciona con Series:
-                imdb_score = float(_col(row, "imdb_score", 0.0))
+                # ✅ CORRECCIÓN: Acceso directo a la Serie de Pandas
+                raw_score = row.get("imdb_score")
 
-                # Esto está correcto, pero si imdb_score es 0.0, score será 0.0
-                score = imdb_score / 2.0 if imdb_score else 0.0
+                # Conversión segura y cálculo
+                imdb_score = float(raw_score) if raw_score is not None and isinstance(raw_score, (int, float)) else 0.0
+                score = imdb_score / 2.0 if imdb_score else 0.0  # Escalando de 10 a 5
 
             elif domain == "book":
-                score = float(_col(row, "google_avg_rating", 0.0))
+                # ✅ CORRECCIÓN: Acceso directo a la Serie de Pandas
+                raw_score = row.get("google_avg_rating")
+
+                # Conversión segura
+                score = float(raw_score) if raw_score is not None and isinstance(raw_score, (int, float)) else 0.0
 
             elif domain == "music":
-                listeners = float(_col(row, "listeners", 1.0))
-                if listeners <= 0:
-                    listeners = 1.0
+                # ✅ CORRECCIÓN: Acceso directo a la Serie de Pandas
+                raw_listeners = row.get("listeners")
+                listeners = float(raw_listeners) if raw_listeners is not None and isinstance(raw_listeners,
+                                                                                             (int, float)) else 1.0
+
+                if listeners <= 0: listeners = 1.0
                 score = math.log10(listeners)
                 score = min(5.0, score / 1.6)
 
@@ -583,7 +589,6 @@ def build_final_grid(session_id: str,
                 score = 0.0
 
         except Exception as score_e:
-            # Captura cualquier error de conversión o cálculo y lo establece a 0.0
             logger.error(f"Error calculating score for {iid} in {domain}: {score_e}")
             score = 0.0
 
