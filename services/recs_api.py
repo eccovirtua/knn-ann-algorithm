@@ -107,6 +107,7 @@ class SessionStateResponse(BaseModel):
     finished: bool
 class FinalListResponse(BaseModel):
     recommendations: List[RecItem]
+    session_avg_quality: float = 0.0
 class SeedResponseWithSessionId(BaseModel):
     session_id: str
     seed_item: Optional[RecItem] = None
@@ -136,6 +137,7 @@ class Domain(str, Enum):
     movie = "movie"
     book = "book"
     music = "music"
+
 def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     token = credentials.credentials
     try:
@@ -561,10 +563,8 @@ def build_final_grid(session_id: str,
 
         try:
             if domain == "movie":
-                # ✅ CORRECCIÓN: Acceso directo a la Serie de Pandas
                 raw_score = row.get("imdb_score")
 
-                # Conversión segura y cálculo
                 imdb_score = float(raw_score) if raw_score is not None and isinstance(raw_score, (int, float)) else 0.0
                 score = imdb_score / 2.0 if imdb_score else 0.0  # Escalando de 10 a 5
 
@@ -594,12 +594,26 @@ def build_final_grid(session_id: str,
 
         item_data_for_mongo = rec_item.model_dump()
         item_data_for_mongo["quality_score"] = round(score, 2)
+        duration_hours = TIME_ESTIMATES.get(domain, 0.0)
+        item_data_for_mongo["duration_hours"] = round(duration_hours, 2)
         final_items_to_save.append(item_data_for_mongo)
-        # persistir en la sesión (guardamos la lista con scores)
-    sessions_col.update_one(
-        {"session_id": session_id},
-        {"$set": {"final_grid": final_items_to_save}}
-    )
+        # ----------------------------------------------------
+        # ✅ 1. CALCULAR Y ALMACENAR EL PROMEDIO DE LA SESIÓN FINAL
+        # ----------------------------------------------------
+        total_quality = sum(item["quality_score"] for item in final_items_to_save)
+        count = len(final_items_to_save)
+
+        # Este es el promedio de calidad de los 20 ítems finales (el valor que quieres)
+        session_avg_quality = round(total_quality / count, 4) if count > 0 else 0.0
+
+        # persistir en la sesión (guardamos la lista con scores Y EL PROMEDIO)
+        sessions_col.update_one(
+            {"session_id": session_id},
+            {"$set": {
+                "final_grid": final_items_to_save,
+                "session_avg_quality_score": session_avg_quality  # 👈 NUEVO CAMPO CRUCIAL
+            }}
+        )
     logger.info("build_final_grid user=%s session=%s domain=%s -> %d items (likes=%d, hidden=%d, underdogs=%d)",
                 user_id, session_id, domain, len(final_rec_items), len(positives), len(hidden_ids), len(underdog_ids))
     # Devolvemos la lista original de RecItems (sin el score) a la app
@@ -980,16 +994,32 @@ def api_get_final_grid(session_id: str, user_id: str = Depends(get_user_id_from_
     )
     return FinalListResponse(recommendations=final_items)
 
+
 @app.post("/session/{session_id}/finalize", response_model=FinalListResponse)
 def api_session_finalize(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
     s = get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
+
+
     sessions_col.update_one(
         {"session_id": session_id},
         {"$set": {"finished": True}}
     )
-    return api_get_final_grid(session_id, user_id)
+    final_response: FinalListResponse = api_get_final_grid(session_id, user_id)
+
+    session_doc = sessions_col.find_one({"session_id": session_id})
+    if not session_doc:
+        raise HTTPException(500, "Session data missing after finalization.")
+
+    session_avg_quality = session_doc.get("session_avg_quality_score", 0.0)
+
+    response_data = final_response.model_dump()
+    response_data["session_avg_quality"] = session_avg_quality
+
+    # Opción 2: Usar .model_copy (Pydantic V2) o .copy(update={...}) (Pydantic V1)
+    # Usaremos la Opción 1 con la reconstrucción por seguridad:
+    return FinalListResponse(**response_data)
 @app.get("/health")
 def health():
     return {"status": "ok"}
