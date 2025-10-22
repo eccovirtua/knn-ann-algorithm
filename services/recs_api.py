@@ -161,6 +161,32 @@ class Domain(str, Enum):
     book = "book"
     music = "music"
 
+
+def _safe_float(value) -> Optional[float]:
+    """Convierte de forma segura a float, o devuelve None si falla o es NaN."""
+    if pd.isna(value): # Esto captura None, np.nan, etc.
+        return None
+    try:
+        f_val = float(value)
+        # Comprueba de nuevo si la conversión resultó en nan (ej. si era "nan")
+        if math.isnan(f_val):
+            return None
+        return f_val
+    except (ValueError, TypeError):
+        return None
+
+def _safe_int(value) -> Optional[int]:
+    """Convierte de forma segura a int, o devuelve None si falla o es NaN."""
+    if pd.isna(value): # Esto captura None, np.nan, etc.
+        return None
+    try:
+        # Usamos float() primero para manejar valores como "5.0" y nan
+        f_val = float(value)
+        if math.isnan(f_val):
+            return None
+        return int(f_val)
+    except (ValueError, TypeError):
+        return None
 def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     token = credentials.credentials
     try:
@@ -1109,9 +1135,14 @@ def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
         year=year,
         # Add domain-specific fields if they exist in your items_df
         artist=row.get("artist"), # Will be None if column doesn't exist or is empty
-        google_avg_rating=row.get("google_avg_rating"),
-        imdb_score=row.get("imdb_score"),
-        listeners=row.get("listeners")
+        # Usa _safe_int porque lo cambiaste a Optional[int]
+        google_avg_rating=_safe_int(row.get("google_avg_rating")),
+
+        # Usa _safe_float para campos float
+        imdb_score=_safe_float(row.get("imdb_score")),
+
+        # Usa _safe_int para campos int
+        listeners=_safe_int(row.get("listeners"))
     )
 
     return details
