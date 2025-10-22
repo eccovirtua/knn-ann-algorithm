@@ -1,6 +1,9 @@
 # services/recs_api.py
 import os
 import re
+from fastapi import Response # <-- Asegúrate que 'Response' esté
+from starlette.status import HTTP_204_NO_CONTENT
+from bson import ObjectId # <-- ¡MUY IMPORTANTE para MongoDB!
 import sys
 import logging
 from enum import Enum
@@ -58,12 +61,18 @@ mongo = MongoClient(MONGO_URI)
 db = mongo.get_database()
 feedback_col = db.get_collection("feedback")
 sessions_col = db.get_collection("sessions")
-session_feedback_col = db.get_collection("session_feedback")  # legado; no es fuente de verdad del nuevo flujo
+session_feedback_col = db.get_collection("session_feedback")
+user_lists_col = db.get_collection("user_lists")
 
 # índices defensivos
 try:
     feedback_col.create_index([("user_id", 1), ("domain", 1), ("item_id", 1)], unique=True)
     sessions_col.create_index([("session_id", 1)], unique=True)
+except Exception as e:
+    logger.warning("No se pudo crear índices: %s", e)
+
+try:
+    user_lists_col.create_index([("user_id", 1), ("name", 1)], unique=True)  # <-- AÑADIR ESTA
 except Exception as e:
     logger.warning("No se pudo crear índices: %s", e)
 
@@ -161,6 +170,25 @@ class Domain(str, Enum):
     book = "book"
     music = "music"
 
+class ListCreateRequest(BaseModel):
+    name: str
+
+class ListUpdateRequest(BaseModel):
+    name: str # Para PUT, solo se puede actualizar el nombre
+
+class ItemAddRequest(BaseModel):
+    item_id: str
+
+# Modelo para la info BÁSICA de la lista (para mostrar en la app)
+class UserListBasic(BaseModel):
+    list_id: str
+    name: str
+    item_count: int
+
+# Modelo para la lista COMPLETA (cuando el usuario entra a verla)
+class UserListDetail(UserListBasic):
+    # Reutilizamos SearchResultItem para mostrar los items
+    items: List[SearchResultItem]
 
 def _safe_float(value) -> Optional[float]:
     """Convierte de forma segura a float, o devuelve None si falla o es NaN."""
@@ -1160,6 +1188,184 @@ def api_search_items(query: str, limit: int = 20, user_id: str = Depends(get_use
     return SearchResponse(results=results)
 
 
+# ----------------------------------------
+# ENDPOINTS DE LISTAS DE USUARIO
+# ----------------------------------------
+
+@app.post("/lists", response_model=UserListBasic)
+def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_user_id_from_jwt)):
+    """Crea una nueva lista para el usuario."""
+    now = datetime.now(timezone.utc)
+
+    if not req.name or len(req.name) < 1:
+        raise HTTPException(status_code=400, detail="El nombre de la lista no puede estar vacío")
+
+    new_list = {
+        "user_id": user_id,
+        "name": req.name,
+        "created_at": now,
+        "items": []
+    }
+    try:
+        result = user_lists_col.insert_one(new_list)
+        return UserListBasic(
+            list_id=str(result.inserted_id),
+            name=req.name,
+            item_count=0
+        )
+    except Exception as err:
+        logger.error(f"Error al crear lista: {err}")
+        # Error 11000 es duplicado en Mongo
+        if "E11000" in str(err):
+            raise HTTPException(status_code=400, detail="Ya existe una lista con ese nombre")
+        raise HTTPException(status_code=500, detail="Error interno al crear la lista")
+
+
+@app.get("/lists", response_model=List[UserListBasic])
+def api_get_my_lists(user_id: str = Depends(get_user_id_from_jwt)):
+    """Obtiene todas las listas (solo metadata) de un usuario."""
+    lists_cursor = user_lists_col.find({"user_id": user_id}).sort("created_at", -1)
+    results = []
+    for list_doc in lists_cursor:
+        results.append(UserListBasic(
+            list_id=str(list_doc["_id"]),
+            name=list_doc.get("name", "Lista sin nombre"),
+            item_count=len(list_doc.get("items", []))
+        ))
+    return results
+
+
+@app.post("/lists/{list_id}/items", response_model=UserListBasic)
+def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str = Depends(get_user_id_from_jwt)):
+    """Añade un item_id a una lista. Es 'idempotente' (no añade duplicados)."""
+
+    # 1. Validar que el item existe
+    if req.item_id not in movieid_to_index:
+        raise HTTPException(status_code=404, detail="Item no encontrado en el catálogo")
+
+    # 2. Añadir a la lista (usando $addToSet para evitar duplicados)
+    try:
+        result = user_lists_col.update_one(
+            {"_id": ObjectId(list_id), "user_id": user_id},
+            {"$addToSet": {"items": req.item_id}}
+        )
+    except Exception as err:
+        raise HTTPException(status_code=400, detail="ID de lista inválido")
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
+
+    # 3. Devolver el estado actualizado de la lista
+    updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
+    return UserListBasic(
+        list_id=str(updated_doc["_id"]),
+        name=updated_doc.get("name"),
+        item_count=len(updated_doc.get("items", []))
+    )
+
+
+# --- ENDPOINTS ADICIONALES ---
+
+@app.get("/lists/{list_id}", response_model=UserListDetail)
+def api_get_list_details(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """Obtiene una lista específica, incluyendo todos sus items."""
+    try:
+        list_doc = user_lists_col.find_one({"_id": ObjectId(list_id), "user_id": user_id})
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID de lista inválido")
+
+    if not list_doc:
+        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
+
+    item_ids = list_doc.get("items", [])
+    item_details_list = []
+
+    # Buscamos los detalles de cada item_id
+    for item_id in item_ids:
+        if item_id in movieid_to_index:
+            row = items_df.loc[movieid_to_index[item_id]]
+            rec_item = row_to_recitem(row, distance=0.0)  # Reutilizamos la función que ya obtiene imágenes
+            item_details_list.append(SearchResultItem(
+                item_id=rec_item.item_id,
+                title=rec_item.title,
+                domain=row.get("domain", "unknown"),
+                image_url=rec_item.image_url
+            ))
+
+    return UserListDetail(
+        list_id=str(list_doc["_id"]),
+        name=list_doc.get("name"),
+        item_count=len(item_details_list),
+        items=item_details_list
+    )
+
+
+@app.put("/lists/{list_id}", response_model=UserListBasic)
+def api_update_list_name(list_id: str, req: ListUpdateRequest, user_id: str = Depends(get_user_id_from_jwt)):
+    """Actualiza el nombre de una lista."""
+    if not req.name or len(req.name) < 1:
+        raise HTTPException(status_code=400, detail="El nombre de la lista no puede estar vacío")
+
+    try:
+        result = user_lists_col.update_one(
+            {"_id": ObjectId(list_id), "user_id": user_id},
+            {"$set": {"name": req.name}}
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID de lista inválido")
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
+
+    updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
+    return UserListBasic(
+        list_id=str(updated_doc["_id"]),
+        name=updated_doc.get("name"),
+        item_count=len(updated_doc.get("items", []))
+    )
+
+
+@app.delete("/lists/{list_id}", status_code=HTTP_204_NO_CONTENT)
+def api_delete_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """Elimina una lista completa."""
+    try:
+        result = user_lists_col.delete_one(
+            {"_id": ObjectId(list_id), "user_id": user_id}
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID de lista inválido")
+
+    if result.deleted_count == 0:
+        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
+
+    # Si tiene éxito, devuelve un 204 No Content
+    return Response(status_code=HTTP_204_NO_CONTENT)
+
+
+@app.delete("/lists/{list_id}/items/{item_id}", response_model=UserListBasic)
+def api_remove_item_from_list(list_id: str, item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """Elimina un solo item de una lista."""
+    try:
+        result = user_lists_col.update_one(
+            {"_id": ObjectId(list_id), "user_id": user_id},
+            {"$pull": {"items": item_id}}  # $pull elimina el item del array
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID de lista inválido")
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
+
+    if result.modified_count == 0:
+        # Esto no es un error, solo significa que el item no estaba en la lista
+        pass
+
+    updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
+    return UserListBasic(
+        list_id=str(updated_doc["_id"]),
+        name=updated_doc.get("name"),
+        item_count=len(updated_doc.get("items", []))
+    )
 @app.get("/item/{item_id}", response_model=ItemDetailResponse)
 def api_get_item_details(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
     """
