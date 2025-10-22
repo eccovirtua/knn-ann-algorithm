@@ -1,5 +1,6 @@
 # services/recs_api.py
 import os
+import re
 import sys
 import logging
 from enum import Enum
@@ -105,6 +106,28 @@ class SessionStateResponse(BaseModel):
     iterations: int
     limit: int
     finished: bool
+
+class SearchResultItem(BaseModel):
+    item_id: str
+    title: str
+    domain: str # Good to know the type in search results
+    image_url: Optional[str] = None
+
+class SearchResponse(BaseModel):
+    results: List[SearchResultItem]
+
+class ItemDetailResponse(RecItem): # Inherit from RecItem to include basic fields
+    # Add any other specific details you want to show, if available in items_df
+    # For example:
+    genres: Optional[List[str]] = None
+    year: Optional[str] = None
+    # Add 'artist' for music, 'director' for movies etc. if they exist in items_df
+    # Example for music:
+    artist: Optional[str] = None
+    # Example specific field from your dataset (if it exists)
+    google_avg_rating: Optional[float] = None
+    imdb_score: Optional[float] = None
+    listeners: Optional[int] = None
 class FinalListResponse(BaseModel):
     recommendations: List[RecItem]
     session_avg_quality: float = 0.0
@@ -1020,6 +1043,98 @@ def api_session_finalize(session_id: str, user_id: str = Depends(get_user_id_fro
     # Opción 2: Usar .model_copy (Pydantic V2) o .copy(update={...}) (Pydantic V1)
     # Usaremos la Opción 1 con la reconstrucción por seguridad:
     return FinalListResponse(**response_data)
+
+def search_items(query: str, limit: int = 20) -> List[SearchResultItem]:
+    """
+    Searches items_df for titles containing the query (case-insensitive).
+    Returns a list of matching items formatted as SearchResultItem.
+    """
+    if not query or len(query) < 2: # Basic validation
+        return []
+
+    # Case-insensitive search on the 'title' column
+    # We use .str.contains() for partial matches
+    matches = items_df[items_df['title'].str.contains(query, case=False, na=False)]
+
+    # Limit the number of results
+    matches = matches.head(limit)
+
+    results = []
+    for _, row in matches.iterrows():
+        # Use row_to_recitem to get consistent image URL handling (incl. placeholders)
+        rec_item = row_to_recitem(row, distance=0.0) # distance is irrelevant here
+        results.append(SearchResultItem(
+            item_id=row['itemId'],
+            title=row['title'],
+            domain=row['domain'],
+            image_url=rec_item.image_url # Get the potentially cleaned/fetched image URL
+        ))
+    return results
+def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
+    """
+    Finds an item by its ID in items_df and returns detailed information.
+    """
+    # Find the row corresponding to the item_id
+    item_row = items_df[items_df['itemId'] == item_id]
+
+    if item_row.empty:
+        return None # Item not found
+
+    row = item_row.iloc[0] # Get the first (and only) row as a Series
+
+    # Use row_to_recitem to get basic info + cleaned image URL
+    rec_item = row_to_recitem(row, distance=0.0)
+
+    # Extract additional details based on domain (adapt field names to YOUR dataset)
+    genres_list = None
+    genres_data = row.get("genres") # Assuming 'genres' column exists
+    if isinstance(genres_data, str):
+        genres_list = [g.strip() for g in genres_data.split('|') if g.strip()]
+    elif isinstance(genres_data, (list, np.ndarray)):
+         genres_list = [str(g).strip() for g in genres_data if str(g).strip()]
+
+    year_match = re.search(r"\((\d{4})\)", row['title'])
+    year = year_match.group(1) if year_match else row.get("year_str") # Reuse year extraction if available
+
+    # Build the detailed response
+    details = ItemDetailResponse(
+        item_id=rec_item.item_id,
+        title=rec_item.title,
+        distance=rec_item.distance,
+        image_url=rec_item.image_url,
+        genres=genres_list,
+        year=year,
+        # Add domain-specific fields if they exist in your items_df
+        artist=row.get("artist"), # Will be None if column doesn't exist or is empty
+        google_avg_rating=row.get("google_avg_rating"),
+        imdb_score=row.get("imdb_score"),
+        listeners=row.get("listeners")
+    )
+
+    return details
+
+
+@app.get("/search", response_model=SearchResponse)
+def api_search_items(query: str, limit: int = 20, user_id: str = Depends(get_user_id_from_jwt)):
+    """
+    Endpoint to search for items by title query. Requires authentication.
+    """
+    if len(query) < 3:
+        raise HTTPException(status_code=400, detail="Query must be at least 3 characters long")
+
+    results = search_items(query, limit)
+    return SearchResponse(results=results)
+
+
+@app.get("/item/{item_id}", response_model=ItemDetailResponse)
+def api_get_item_details(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """
+    Endpoint to get detailed information for a specific item_id. Requires authentication.
+    """
+    details = get_item_details(item_id)
+    if details is None:
+        raise HTTPException(status_code=404, detail=f"Item with ID '{item_id}' not found")
+    return details
 @app.get("/health")
 def health():
     return {"status": "ok"}
