@@ -125,7 +125,7 @@ class ItemDetailResponse(RecItem): # Inherit from RecItem to include basic field
     # Example for music:
     artist: Optional[str] = None
     # Example specific field from your dataset (if it exists)
-    google_avg_rating: Optional[float] = None
+    google_avg_rating: Optional[int] = None
     imdb_score: Optional[float] = None
     listeners: Optional[int] = None
 class FinalListResponse(BaseModel):
@@ -1070,6 +1070,7 @@ def search_items(query: str, limit: int = 20) -> List[SearchResultItem]:
             image_url=rec_item.image_url # Get the potentially cleaned/fetched image URL
         ))
     return results
+
 def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
     """
     Finds an item by its ID in items_df and returns detailed information.
@@ -1087,6 +1088,8 @@ def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
 
     # Extract additional details based on domain (adapt field names to YOUR dataset)
     genres_list = None
+
+
     genres_data = row.get("genres") # Assuming 'genres' column exists
     if isinstance(genres_data, str):
         genres_list = [g.strip() for g in genres_data.split('|') if g.strip()]
