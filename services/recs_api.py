@@ -174,7 +174,9 @@ class ListCreateRequest(BaseModel):
     name: str
 
 class ListUpdateRequest(BaseModel):
-    name: str # Para PUT, solo se puede actualizar el nombre
+    icon_name: str
+    color_hex: str
+    name: str
 
 class ItemAddRequest(BaseModel):
     item_id: str
@@ -184,6 +186,8 @@ class UserListBasic(BaseModel):
     list_id: str
     name: str
     item_count: int
+    icon_name: str  # SÍ está definido aquí
+    color_hex: str  # SÍ está definido aquí
 
 # Modelo para la lista COMPLETA (cuando el usuario entra a verla)
 class UserListDetail(UserListBasic):
@@ -1211,7 +1215,9 @@ def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_user_id_f
         return UserListBasic(
             list_id=str(result.inserted_id),
             name=req.name,
-            item_count=0
+            item_count=0,
+            icon_name=req.icon_name,
+            color_hex=req.color_hex
         )
     except Exception as err:
         logger.error(f"Error al crear lista: {err}")
@@ -1230,6 +1236,8 @@ def api_get_my_lists(user_id: str = Depends(get_user_id_from_jwt)):
         results.append(UserListBasic(
             list_id=str(list_doc["_id"]),
             name=list_doc.get("name", "Lista sin nombre"),
+            icon_name=list_doc.get("icon_name", "default"),
+            color_hex=list_doc.get("color_hex", "#FFFFFF"),
             item_count=len(list_doc.get("items", []))
         ))
     return results
@@ -1260,6 +1268,8 @@ def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str = Depen
     return UserListBasic(
         list_id=str(updated_doc["_id"]),
         name=updated_doc.get("name"),
+        icon_name=updated_doc.get("icon_name", "default"),
+        color_hex=updated_doc.get("color_hex", "#FFFFFF"),
         item_count=len(updated_doc.get("items", []))
     )
 
@@ -1296,20 +1306,29 @@ def api_get_list_details(list_id: str, user_id: str = Depends(get_user_id_from_j
         list_id=str(list_doc["_id"]),
         name=list_doc.get("name"),
         item_count=len(item_details_list),
+        icon_name=list_doc.get("icon_name", "default"),
+        color_hex=list_doc.get("color_hex", "#FFFFFF"),
         items=item_details_list
     )
 
 
 @app.put("/lists/{list_id}", response_model=UserListBasic)
-def api_update_list_name(list_id: str, req: ListUpdateRequest, user_id: str = Depends(get_user_id_from_jwt)):
-    """Actualiza el nombre de una lista."""
+def api_update_list(list_id: str, req: ListUpdateRequest, user_id: str = Depends(get_user_id_from_jwt)):
+    """Actualiza nombre, icono y color de una lista."""  # <-- Descripción actualizada
     if not req.name or len(req.name) < 1:
         raise HTTPException(status_code=400, detail="El nombre de la lista no puede estar vacío")
+
+    # 🎯 CREA EL DICCIONARIO CON LOS 3 CAMPOS
+    update_data = {
+        "name": req.name,
+        "icon_name": req.icon_name,
+        "color_hex": req.color_hex
+    }
 
     try:
         result = user_lists_col.update_one(
             {"_id": ObjectId(list_id), "user_id": user_id},
-            {"$set": {"name": req.name}}
+            {"$set": update_data}  # <-- USA EL DICCIONARIO COMPLETO
         )
     except Exception:
         raise HTTPException(status_code=400, detail="ID de lista inválido")
@@ -1318,9 +1337,12 @@ def api_update_list_name(list_id: str, req: ListUpdateRequest, user_id: str = De
         raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
 
     updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
+    # 🎯 DEVUELVE EL UserListBasic COMPLETO
     return UserListBasic(
         list_id=str(updated_doc["_id"]),
         name=updated_doc.get("name"),
+        icon_name=updated_doc.get("icon_name", "default"),  # Añade valores por defecto
+        color_hex=updated_doc.get("color_hex", "#FFFFFF"),  # Añade valores por defecto
         item_count=len(updated_doc.get("items", []))
     )
 
@@ -1364,6 +1386,8 @@ def api_remove_item_from_list(list_id: str, item_id: str, user_id: str = Depends
     return UserListBasic(
         list_id=str(updated_doc["_id"]),
         name=updated_doc.get("name"),
+        icon_name=updated_doc.get("icon_name", "default"),
+        color_hex=updated_doc.get("color_hex", "#FFFFFF"),
         item_count=len(updated_doc.get("items", []))
     )
 @app.get("/item/{item_id}", response_model=ItemDetailResponse)
