@@ -1238,6 +1238,8 @@ def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_user_id_f
     new_list = {
         "user_id": user_id,
         "name": req.name,
+        "icon_name": req.icon_name,
+        "color_hex": req.color_hex,
         "created_at": now,
         "items": []
     }
@@ -1247,6 +1249,7 @@ def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_user_id_f
             list_id=str(result.inserted_id),
             name=req.name,
             item_count=0,
+
             icon_name=req.icon_name,
             color_hex=req.color_hex
         )
