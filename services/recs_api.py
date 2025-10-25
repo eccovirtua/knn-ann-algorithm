@@ -43,6 +43,7 @@ MONGO_URI = os.getenv("MONGODB_URI")
 if not MONGO_URI:
     raise RuntimeError("MONGODB_URI is not defined")
 
+SESSION_DAILY_LIMIT = 3 # Límite diario
 # ---------- app ----------
 app = FastAPI(title="Recommendation Service")
 app.add_middleware(
@@ -76,6 +77,11 @@ try:
 except Exception as e:
     logger.warning("No se pudo crear índices: %s", e)
 
+try:
+    sessions_col.create_index([("user_id", 1), ("created_date_utc", 1)]) # <-- AÑADIR ESTA
+except Exception as e:
+    logger.warning("No se pudo crear índices: %s", e)
+
 # ---------- assets vectorizados (items + embeddings + annoy) ----------
 BASE_DIR = Path(__file__).resolve().parents[1]
 VECT_DIR = BASE_DIR / "data" / "vectorized"
@@ -94,6 +100,12 @@ class RecItem(BaseModel):
     title: str
     distance: float
     image_url: Optional[str] = None
+
+class UserUsageStatus(BaseModel):
+    daily_limit: int
+    sessions_today: int
+    remaining_today: int
+
 class RecommendRequest(BaseModel):
     item_id: str
     top_n: int = 5
@@ -890,6 +902,24 @@ def api_get_user_dashboard_stats(user_id: str = Depends(get_user_id_from_jwt)):
 
 # ---------- Session endpoints (nuevo flujo) ----------
 def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
+
+    # 1. Obtener fecha UTC actual
+    now = datetime.now(timezone.utc)
+    today_utc_str = now.strftime('%Y-%m-%d')  # Formato YYYY-MM-DD
+
+    daily_count = sessions_col.count_documents({
+        "user_id": user_id,
+        "created_date_utc": today_utc_str
+    })
+
+    if daily_count >= SESSION_DAILY_LIMIT:
+        logger.warning(f"Límite diario alcanzado para usuario {user_id}. Count={daily_count}")
+        raise HTTPException(
+            status_code=429,  # Too Many Requests
+            detail=f"Has alcanzado el límite de {SESSION_DAILY_LIMIT} sesiones por día."
+        )
+
+
     session_id = str(uuid4())
     seed = generate_new_seed(domain)
     now = datetime.now(timezone.utc)
@@ -898,6 +928,7 @@ def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
         "user_id": user_id,
         "domain": domain,
         "created_at": now,
+        "created_date_utc": today_utc_str,  # Solo la fecha YYYY-MM-DD para contar
         "last_item_id": seed.item_id,
         "iterations": 0,
         "limit": SESSION_ITER_LIMIT,
@@ -1399,6 +1430,27 @@ def api_get_item_details(item_id: str, user_id: str = Depends(get_user_id_from_j
     if details is None:
         raise HTTPException(status_code=404, detail=f"Item with ID '{item_id}' not found")
     return details
+
+
+@app.get("/user/usage", response_model=UserUsageStatus)
+def api_get_user_usage(user_id: str = Depends(get_user_id_from_jwt)):
+    """Devuelve el estado de uso de sesiones diarias del usuario."""
+    today_utc_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
+
+    sessions_today = sessions_col.count_documents({
+        "user_id": user_id,
+        "created_date_utc": today_utc_str
+    })
+
+    remaining = max(0, SESSION_DAILY_LIMIT - sessions_today)
+
+    return UserUsageStatus(
+        daily_limit=SESSION_DAILY_LIMIT,
+        sessions_today=sessions_today,
+        remaining_today=remaining
+    )
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
