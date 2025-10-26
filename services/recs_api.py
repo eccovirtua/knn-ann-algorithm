@@ -193,6 +193,8 @@ class Domain(str, Enum):
 
 class ListCreateRequest(BaseModel):
     name: str
+    icon_name: str
+    color_hex: str
 
 class ListUpdateRequest(BaseModel):
     icon_name: str
@@ -1280,12 +1282,21 @@ def api_get_my_lists(
     # 🎯 Explicitly type the query dictionary to accept Any value type
     query: Dict[str, Any] = {"user_id": user_id}
 
-    if archived is not None:
-        # This assignment is now valid because query accepts Any
-        query["is_archived"] = archived
-    else:
-        # This assignment is also valid
-        query["is_archived"] = {"$ne": True} # $ne = Not Equal
+    if archived is True:
+        # If explicitly asking for archived, only get those where is_archived is true
+        query["is_archived"] = True
+    elif archived is False:
+        # If explicitly asking for non-archived, get those where is_archived is false OR the field doesn't exist
+        query["$or"] = [
+            {"is_archived": False},
+            {"is_archived": {"$exists": False}}
+        ]
+    else:  # archived is None (default case when calling from UserProfileViewModel)
+        # Default: Get non-archived (is_archived is false OR field doesn't exist)
+        query["$or"] = [
+            {"is_archived": False},
+            {"is_archived": {"$exists": False}}
+        ]
 
     lists_cursor = user_lists_col.find(query).sort("created_at", -1)
     results = []
