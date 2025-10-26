@@ -1,7 +1,7 @@
 # services/recs_api.py
 import os
 import re
-from fastapi import Response # <-- Asegúrate que 'Response' esté
+from fastapi import Response, Query  # <-- Asegúrate que 'Response' esté
 from starlette.status import HTTP_204_NO_CONTENT
 from bson import ObjectId # <-- ¡MUY IMPORTANTE para MongoDB!
 import sys
@@ -9,7 +9,7 @@ import logging
 from enum import Enum
 from uuid import uuid4
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import List, Tuple, Optional, Dict, Any
 from dotenv import load_dotenv
 import math
 from fastapi import FastAPI, HTTPException, Depends
@@ -64,8 +64,13 @@ feedback_col = db.get_collection("feedback")
 sessions_col = db.get_collection("sessions")
 session_feedback_col = db.get_collection("session_feedback")
 user_lists_col = db.get_collection("user_lists")
+user_favorites_col = db.get_collection("user_favorites")
 
 # índices defensivos
+try:
+    user_favorites_col.create_index([("user_id", 1), ("item_id", 1)], unique=True) # <-- NUEVO ÍNDICE
+except Exception as e:
+    logger.warning("No se pudo crear índices: %s", e)
 try:
     feedback_col.create_index([("user_id", 1), ("domain", 1), ("item_id", 1)], unique=True)
     sessions_col.create_index([("session_id", 1)], unique=True)
@@ -100,6 +105,10 @@ class RecItem(BaseModel):
     title: str
     distance: float
     image_url: Optional[str] = None
+
+class FavoriteStatusResponse(BaseModel):
+    item_id: str
+    is_favorite: bool
 
 class UserUsageStatus(BaseModel):
     daily_limit: int
@@ -199,7 +208,8 @@ class UserListBasic(BaseModel):
     name: str
     item_count: int
     icon_name: str  # SÍ está definido aquí
-    color_hex: str  # SÍ está definido aquí
+    color_hex: str
+    is_archived: bool = False
 
 # Modelo para la lista COMPLETA (cuando el usuario entra a verla)
 class UserListDetail(UserListBasic):
@@ -1262,9 +1272,22 @@ def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_user_id_f
 
 
 @app.get("/lists", response_model=List[UserListBasic])
-def api_get_my_lists(user_id: str = Depends(get_user_id_from_jwt)):
-    """Obtiene todas las listas (solo metadata) de un usuario."""
-    lists_cursor = user_lists_col.find({"user_id": user_id}).sort("created_at", -1)
+def api_get_my_lists(
+    archived: Optional[bool] = Query(None, description="Filtrar por estado archivado (true/false)"),
+    user_id: str = Depends(get_user_id_from_jwt)
+):
+    """Obtiene listas de un usuario, opcionalmente filtradas por estado archivado."""
+    # 🎯 Explicitly type the query dictionary to accept Any value type
+    query: Dict[str, Any] = {"user_id": user_id}
+
+    if archived is not None:
+        # This assignment is now valid because query accepts Any
+        query["is_archived"] = archived
+    else:
+        # This assignment is also valid
+        query["is_archived"] = {"$ne": True} # $ne = Not Equal
+
+    lists_cursor = user_lists_col.find(query).sort("created_at", -1)
     results = []
     for list_doc in lists_cursor:
         results.append(UserListBasic(
@@ -1272,11 +1295,10 @@ def api_get_my_lists(user_id: str = Depends(get_user_id_from_jwt)):
             name=list_doc.get("name", "Lista sin nombre"),
             icon_name=list_doc.get("icon_name", "default"),
             color_hex=list_doc.get("color_hex", "#FFFFFF"),
-            item_count=len(list_doc.get("items", []))
+            item_count=len(list_doc.get("items", [])),
+            is_archived=list_doc.get("is_archived", False)
         ))
     return results
-
-
 @app.post("/lists/{list_id}/items", response_model=UserListBasic)
 def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str = Depends(get_user_id_from_jwt)):
     """Añade un item_id a una lista. Es 'idempotente' (no añade duplicados)."""
@@ -1453,6 +1475,115 @@ def api_get_user_usage(user_id: str = Depends(get_user_id_from_jwt)):
         remaining_today=remaining
     )
 
+# --- Nuevos Endpoints (añadir cerca de los otros endpoints de listas) ---
+
+@app.put("/lists/{list_id}/archive", response_model=UserListBasic)
+def api_archive_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """Marca una lista como archivada."""
+    try:
+        result = user_lists_col.update_one(
+            {"_id": ObjectId(list_id), "user_id": user_id},
+            {"$set": {"is_archived": True}}
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID de lista inválido")
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
+
+    updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
+    # Devuelve el estado actualizado completo
+    return UserListBasic(
+        list_id=str(updated_doc["_id"]),
+        name=updated_doc.get("name"),
+        icon_name=updated_doc.get("icon_name", "default"),
+        color_hex=updated_doc.get("color_hex", "#FFFFFF"),
+        item_count=len(updated_doc.get("items", [])),
+        is_archived=updated_doc.get("is_archived", False) # Incluir estado archivado
+    )
+
+@app.put("/lists/{list_id}/unarchive", response_model=UserListBasic)
+def api_unarchive_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """Desmarca una lista como archivada."""
+    try:
+        result = user_lists_col.update_one(
+            {"_id": ObjectId(list_id), "user_id": user_id},
+            # Puedes usar $set o $unset, $set es más simple si siempre existe
+            {"$set": {"is_archived": False}}
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID de lista inválido")
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
+
+    updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
+    # Devuelve el estado actualizado completo
+    return UserListBasic(
+        list_id=str(updated_doc["_id"]),
+        name=updated_doc.get("name"),
+        icon_name=updated_doc.get("icon_name", "default"),
+        color_hex=updated_doc.get("color_hex", "#FFFFFF"),
+        item_count=len(updated_doc.get("items", [])),
+        is_archived=updated_doc.get("is_archived", False) # Incluir estado archivado
+    )
+# --- Nuevos Endpoints (añadir cerca de los otros endpoints de listas/final) ---
+
+@app.post("/favorites/{item_id}", status_code=201) # 201 Created
+def api_add_favorite(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """Añade un item a los favoritos del usuario."""
+    if item_id not in movieid_to_index:
+        raise HTTPException(status_code=404, detail="Item no encontrado en el catálogo")
+
+    now = datetime.now(timezone.utc)
+    favorite_doc = {
+        "user_id": user_id,
+        "item_id": item_id,
+        "added_at": now
+    }
+    try:
+        user_favorites_col.insert_one(favorite_doc)
+        return {"message": "Item añadido a favoritos"}
+    except Exception as e: # Captura error de duplicado (índice único)
+        if "E11000" in str(e):
+             # No es un error si ya existe, es idempotente
+            return {"message": "Item ya estaba en favoritos"}
+        logger.error(f"Error añadiendo favorito: {e}")
+        raise HTTPException(status_code=500, detail="Error interno al añadir favorito")
+
+@app.delete("/favorites/{item_id}", status_code=HTTP_204_NO_CONTENT)
+def api_remove_favorite(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """Elimina un item de los favoritos del usuario."""
+    result = user_favorites_col.delete_one({"user_id": user_id, "item_id": item_id})
+    if result.deleted_count == 0:
+        # No encontrado, pero la operación es idempotente (el estado deseado es "no favorito")
+        pass
+    return Response(status_code=HTTP_204_NO_CONTENT)
+
+@app.get("/favorites", response_model=List[SearchResultItem])
+def api_get_favorites(user_id: str = Depends(get_user_id_from_jwt)):
+    """Obtiene todos los items favoritos de un usuario."""
+    favorites_cursor = user_favorites_col.find({"user_id": user_id}).sort("added_at", -1)
+    favorite_item_ids = [doc["item_id"] for doc in favorites_cursor]
+
+    results = []
+    for item_id in favorite_item_ids:
+        if item_id in movieid_to_index:
+            row = items_df.loc[movieid_to_index[item_id]]
+            rec_item = row_to_recitem(row, distance=0.0)
+            results.append(SearchResultItem(
+                item_id=rec_item.item_id,
+                title=rec_item.title,
+                domain=row.get("domain", "unknown"),
+                image_url=rec_item.image_url
+            ))
+    return results
+
+@app.get("/favorites/status/{item_id}", response_model=FavoriteStatusResponse)
+def api_get_favorite_status(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """Verifica si un item específico está en los favoritos del usuario."""
+    count = user_favorites_col.count_documents({"user_id": user_id, "item_id": item_id})
+    return FavoriteStatusResponse(item_id=item_id, is_favorite=(count > 0))
 
 @app.get("/health")
 def health():
