@@ -1596,6 +1596,66 @@ def api_get_favorite_status(item_id: str, user_id: str = Depends(get_user_id_fro
     count = user_favorites_col.count_documents({"user_id": user_id, "item_id": item_id})
     return FavoriteStatusResponse(item_id=item_id, is_favorite=(count > 0))
 
+# Endpoint para randomizar
+@app.post("/session/{session_id}/randomize", response_model=SeedResponse)
+def api_session_randomize(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    """Busca un nuevo item aleatorio para la sesión, evitando los ya mostrados."""
+    s = get_session(session_id)
+    if not s or s["user_id"] != user_id:
+        raise HTTPException(404, "Session not found or unauthorized")
+    if bool(s.get("finished", False)):
+         raise HTTPException(400, "Session already finished")
+
+    domain = s["domain"]
+    history = s.get("history", [])
+    shown_in_session: List[str] = list(s.get("shown", [])) # Items ya mostrados en ESTA sesión
+    last_item_id = s.get("last_item_id")
+
+    # 1. Marcar el item actual como visto (feedback neutro 0) si aún no está en historial
+    #    (Esto evita que se vuelva a mostrar si se randomiza varias veces seguidas)
+    if last_item_id and (not history or history[-1][0] != last_item_id):
+         history.append((last_item_id, 0)) # Añadir con feedback 0
+         # También añadirlo a 'shown' si no estaba (aunque debería estar si es last_item_id)
+         if last_item_id not in shown_in_session:
+              shown_in_session.append(last_item_id)
+
+    # 2. Buscar un nuevo candidato aleatorio
+    candidates_df = items_df[
+        (items_df["domain"] == domain) &
+        (~items_df["itemId"].isin(shown_in_session)) # Excluir los ya mostrados en la sesión
+    ]
+
+    if candidates_df.empty:
+        # No quedan items aleatorios por mostrar en este dominio para esta sesión
+        # Podríamos finalizar la sesión o devolver un error específico
+        # Por ahora, finalizamos la sesión
+        sessions_col.update_one(
+            {"session_id": session_id},
+            {"$set": {"finished": True, "history": history, "shown": shown_in_session}}
+        )
+        logger.info(f"No more random items for session {session_id}, finalizing.")
+        return SeedResponse(seed_item=None) # Indica al frontend que terminó
+
+    # 3. Seleccionar uno aleatorio y actualizar la sesión
+    new_random_row = candidates_df.sample(1).iloc[0]
+    new_seed = row_to_recitem(new_random_row, distance=0.0) # Distancia no aplica
+
+    # No añadimos el nuevo item a 'shown' ni 'history' todavía,
+    # solo actualizamos last_item_id. Se añadirá cuando el usuario interactúe
+    # o vuelva a randomizar. NO incrementamos 'iterations' aquí tampoco.
+    sessions_col.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "last_item_id": new_seed.item_id,
+            "history": history, # Guardamos el historial actualizado (con el item anterior como neutro)
+            "shown": shown_in_session # Guardamos los 'shown' actualizados
+            # 'iterations' NO se toca aquí, solo cuenta interacciones reales
+        }}
+    )
+
+    logger.info(f"Randomized seed for session {session_id} to {new_seed.item_id}")
+    return SeedResponse(seed_item=new_seed)
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
