@@ -1611,19 +1611,20 @@ def api_session_randomize(session_id: str, user_id: str = Depends(get_user_id_fr
     shown_in_session: List[str] = list(s.get("shown", [])) # Items ya mostrados en ESTA sesión
     last_item_id = s.get("last_item_id")
 
-    # 1. Marcar el item actual como visto (feedback neutro 0) si aún no está en historial
-    #    (Esto evita que se vuelva a mostrar si se randomiza varias veces seguidas)
+    # 1. Marcar el item actual en HISTORIAL como visto (feedback neutro 0)
     if last_item_id and (not history or history[-1][0] != last_item_id):
-         history.append((last_item_id, 0)) # Añadir con feedback 0
-         # También añadirlo a 'shown' si no estaba (aunque debería estar si es last_item_id)
-         if last_item_id not in shown_in_session:
-              shown_in_session.append(last_item_id)
+        history.append((last_item_id, 0))  # Añadir con feedback 0
+
+        # ❌ NO AÑADIR A 'shown' AQUÍ ❌
+        # if last_item_id not in shown_in_session:
+        #      shown_in_session.append(last_item_id) # <-- ELIMINAR ESTAS LÍNEAS
 
     # 2. Buscar un nuevo candidato aleatorio
     candidates_df = items_df[
         (items_df["domain"] == domain) &
-        (~items_df["itemId"].isin(shown_in_session)) # Excluir los ya mostrados en la sesión
-    ]
+        # Excluir los ya mostrados Y el que acabamos de saltar (que está en history[-1])
+        (~items_df["itemId"].isin(shown_in_session + ([history[-1][0]] if history else [])))
+        ]
 
     if candidates_df.empty:
         # No quedan items aleatorios por mostrar en este dominio para esta sesión
@@ -1649,7 +1650,6 @@ def api_session_randomize(session_id: str, user_id: str = Depends(get_user_id_fr
             "last_item_id": new_seed.item_id,
             "history": history, # Guardamos el historial actualizado (con el item anterior como neutro)
             "shown": shown_in_session # Guardamos los 'shown' actualizados
-            # 'iterations' NO se toca aquí, solo cuenta interacciones reales
         }}
     )
 
