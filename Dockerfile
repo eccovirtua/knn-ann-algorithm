@@ -1,35 +1,19 @@
-FROM python:3.11-slim
+# Dockerfile
+FROM python:3.10-slim
 
-# Dependencias de sistema necesarias
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential \
-    cmake \
-    libopenblas-dev \
-    liblapack-dev \
-    gfortran \
-    git \
-    && rm -rf /var/lib/apt/lists/*
-
+# 1. Configurar directorio de trabajo
 WORKDIR /app
 
-# Actualizar pip y wheel para evitar problemas de compilación
+# 2. Copiar requerimientos e instalar (aprovecha caché de Docker)
 COPY requirements.txt .
-RUN python -m pip install --upgrade pip setuptools wheel \
- && pip install --no-cache-dir -r requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Copiar el código
+# 3. Copiar el resto del código
 COPY . .
 
-# Variables para logging en tiempo real
-ENV PORT=8000
-ENV PYTHONUNBUFFERED=1
-ENV LOG_LEVEL=debug
+# 4. Exponer el puerto que usa Cloud Run (por defecto 8080)
+ENV PORT=8080
 
-# Comando de inicio con logs detallados
-CMD ["bash", "-lc", "gunicorn -k uvicorn.workers.UvicornWorker services.recs_api:app \
- --bind 0.0.0.0:$PORT \
- --workers 1 \
- --log-level debug \
- --access-logfile - \
- --error-logfile - \
- --preload"]
+# 5. Comando de arranque (Uvicorn)
+# Asegúrate de que 'recs_api' coincida con el nombre de tu archivo .py
+CMD ["uvicorn", "recs_api:app", "--host", "0.0.0.0", "--port", "8080"]

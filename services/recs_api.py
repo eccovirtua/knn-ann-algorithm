@@ -1,14 +1,13 @@
 # services/recs_api.py
 import os
 import re
-from fastapi import Response, Query  # <-- Asegúrate que 'Response' esté
+from fastapi import Response, Query
 from starlette.status import HTTP_204_NO_CONTENT
-from bson import ObjectId # <-- ¡MUY IMPORTANTE para MongoDB!
+from bson import ObjectId
 import sys
 import logging
 from enum import Enum
 from uuid import uuid4
-from pathlib import Path
 from typing import List, Tuple, Optional, Dict, Any
 from dotenv import load_dotenv
 import math
@@ -19,8 +18,6 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 import random
 import pandas as pd
-import numpy as np
-from annoy import AnnoyIndex
 from pymongo import MongoClient
 import jwt
 from jwt.exceptions import InvalidTokenError
@@ -48,7 +45,7 @@ SESSION_DAILY_LIMIT = 3 # Límite diario
 app = FastAPI(title="Recommendation Service")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # TODO: restringir en producción
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
@@ -87,17 +84,19 @@ try:
 except Exception as e:
     logger.warning("No se pudo crear índices: %s", e)
 
-# ---------- assets vectorizados (items + embeddings + annoy) ----------
-BASE_DIR = Path(__file__).resolve().parents[1]
-VECT_DIR = BASE_DIR / "data" / "vectorized"
 
-items_df = pd.read_parquet(VECT_DIR / "items.parquet").reset_index(drop=True)
-movieid_to_index = {item: i for i, item in enumerate(items_df["itemId"].tolist())}
-
-embeds = np.load(VECT_DIR / "items_embeds.npz")["embeddings"]
-dim = embeds.shape[1]
-ann_index = AnnoyIndex(dim, metric="angular")
-ann_index.load(str(VECT_DIR / "items_index.ann"))
+items_col = db.get_collection("items_col") 
+try:
+    # Vital para buscar un item rápido por su ID (usado en detalles y recomendaciones)
+    items_col.create_index("itemId", unique=True)
+    
+    # Vital para filtrar por 'movie', 'book', 'music' rápidamente
+    items_col.create_index("domain")
+    
+    # Vital para tu buscador por texto (regex) en search_items
+    items_col.create_index("title") 
+except Exception as e:
+    logger.warning("No se pudo crear índices para items_col: %s", e)
 
 # ---------- modelos Pydantic ----------
 class RecItem(BaseModel):
@@ -287,19 +286,18 @@ BETA_POP = 0.30     # popularidad / base_score
 GAMMA_IMDB = 0.10
 DELTA_NOVELTY = 0.40
 
-def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
-    item_id = row.get("item_id") or row.get("itemId")
-    if item_id is None:
-        print("⚠️ row_to_recitem recibió un row sin item_id válido:", row.to_dict())
-    # Omitimos prints de DEBUG si ya verificamos que funcionan
-    domain = row.get("domain")
-    image_url = row.get("image_url") # Leemos la URL del dataset
+def row_to_recitem(doc:dict, distance: float = 0.0) -> RecItem:
+    item_id = doc.get("item_id") or doc.get("itemId")
+    domain = doc.get("domain")
+    title = doc.get("title", "")
+    image_url = doc.get("image_url") # Leemos la URL del dataset
+
     if domain == "music" and image_url == PLACEHOLDER:
-        # Ya verificaste que esta línea se ejecuta y pone la URL a None
         image_url = None
+
     # --- Movies (TMDB) ---
     if domain == "movie" and not image_url:
-        title = row.get("title", "")
+        title = doc.get("title", "")
         clean_title = title.split("(")[0].strip()
         try:
             image_url = asyncio.run(fetch_movie_poster(clean_title))
@@ -307,9 +305,9 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
             loop = asyncio.get_event_loop()
             image_url = loop.run_until_complete(fetch_movie_poster(clean_title))
     elif domain == "music" and not image_url:
-        artist = row.get("artist", "")
-        track = row.get("title", "")
-        item_id = row.get("item_id") or row.get("itemId") or ""
+        artist = doc.get("artist", "")
+        track = doc.get("title", "")
+        item_id = doc.get("item_id") or doc.get("itemId") or ""
         if not artist and item_id.startswith("lf-") and "_" in item_id:
             try:
                 parts = item_id.replace("lf-", "", 1).split("_", 1)
@@ -335,8 +333,8 @@ def row_to_recitem(row: pd.Series, distance: float = 0.0) -> RecItem:
         image_url = "https://placehold.co/300x450?text=No+Image"
 
     return RecItem(
-        item_id=row.get("item_id") or row.get("itemId") or "",
-        title=row.get("title", ""),
+        item_id=item_id,
+        title=title,
         distance=distance,
         image_url=image_url
     )
@@ -400,88 +398,124 @@ def _rating_count(row: pd.Series) -> int:
 
 # Core algorithm
 def generate_new_seed(domain: str) -> RecItem:
-    candidates = items_df[items_df["domain"] == domain]
-    if candidates.empty:
-        raise HTTPException(404, "no hay items para el dominio")
-    row = candidates.sample(1).iloc[0]
-    return row_to_recitem(row, distance=0.0)
+
+    pipeline = [
+        {"$match": {"domain": domain}},
+        {"$sample": {"size": 1}}
+    ]
+    results = list(items_col.aggregate(pipeline))
+    if not results:
+        raise HTTPException(404, "No hay items para el dominio")
+    return row_to_recitem(results[0], distance=0.0)
 
 def compute_next_seed(user_id: str, domain: str) -> Optional[RecItem]:
     history = get_history(user_id, domain)
-    logger.info("compute_next_seed user=%s domain=%s history_len=%d", user_id, domain, len(history))
-
     shown = {item for item, _ in history}
-    positives = [item for item, fb in history if fb > 0]
+    
+    # 1. Buscar el último ítem positivo (Like)
+    last_positive_id = None
+    for item_id, feedback in reversed(history):
+        if feedback > 0:
+            last_positive_id = item_id
+            break
+            
+    query_vector = None
+    
+    # 2. Si hay positivo, obtenemos su vector desde Mongo para buscar similares
+    if last_positive_id:
+        seed_doc = items_col.find_one({"itemId": last_positive_id}, {"embedding": 1})
+        if seed_doc and "embedding" in seed_doc:
+            query_vector = seed_doc["embedding"]
 
-    if positives:
-        base = positives[-1]
-        idx = movieid_to_index.get(base)
-        if idx is not None:
-            K = 50
-            neigh_idxs, _ = ann_index.get_nns_by_item(idx, K, include_distances=True)
-            for neigh_idx in neigh_idxs[1:]:
-                row = items_df.iloc[neigh_idx]
-                candidate_id = row["itemId"]
-                if row["domain"] == domain and candidate_id not in shown:
-                    return row_to_recitem(row, distance=0.0)
-    # fallback: random outside shown
-    candidates = items_df[(items_df["domain"] == domain) & (~items_df["itemId"].isin(shown))]
-    if not candidates.empty:
-        row = candidates.sample(1).iloc[0]
-        return row_to_recitem(row, distance=0.0)
+    # 3. Construir Pipeline
+    pipeline = []
+    
+    if query_vector:
+        # A) Búsqueda Vectorial (Si tenemos un like previo)
+        pipeline.append({
+            "$vectorSearch": {
+                "index": "vector_index", #index name
+                "path": "embedding",
+                "queryVector": query_vector,
+                "numCandidates": 50,
+                "limit": 10
+            }
+        })
+    else:
+        # B) Muestreo Aleatorio (Si no hay historial o likes)
+        # Random del mismo dominio
+        pipeline.append({"$match": {"domain": domain}})
+        pipeline.append({"$sample": {"size": 10}})
+
+    # 4. Filtrar lo ya visto y el dominio (si usamos vectorSearch)
+    pipeline.append({
+        "$match": {
+            "domain": domain,
+            "itemId": {"$nin": list(shown)} # Excluir lo visto
+        }
+    })
+    
+    # 5. Proyección (No traemos el vector gigante de vuelta)
+    pipeline.append({"$project": {"embedding": 0}})
+    pipeline.append({"$limit": 1}) # Solo necesitamos 1 candidato
+
+    results = list(items_col.aggregate(pipeline))
+    
+    if results:
+        # Convertir resultado de Mongo a tu objeto RecItem
+        return row_to_recitem(results[0], distance=0.0)
+        
     return None
 
 def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domain: str) -> Optional[RecItem]:
-    shown = {item for item, _ in session_history}
     if not session_history:
         return None
 
-    last_item, last_feedback = session_history[-1]
-    idx = movieid_to_index.get(last_item)
-    if idx is None:
-        return None
+    shown = {item for item, _ in session_history}
+    last_item_id, last_feedback = session_history[-1]
+    
+    query_vector = None
 
-    if last_feedback > 0:  # 👍 Like
-        neigh_idxs, dists = ann_index.get_nns_by_item(idx, 30, include_distances=True)
-        candidates = [(n_idx, d) for n_idx, d in zip(neigh_idxs[1:], dists[1:]) if items_df.iloc[n_idx]["domain"] == domain]
-        candidates = [(n_idx, d) for n_idx, d in candidates if items_df.iloc[n_idx]["itemId"] not in shown]
+    # ESTRATEGIA: Si hubo Like, buscamos similares vectoriales
+    if last_feedback > 0:
+        seed_doc = items_col.find_one({"itemId": last_item_id}, {"embedding": 1})
+        if seed_doc and "embedding" in seed_doc:
+            query_vector = seed_doc["embedding"]
+    
+    pipeline = []
+    
+    if query_vector:
+        # Búsqueda por Similitud
+        pipeline.append({
+            "$vectorSearch": {
+                "index": "vector_index",
+                "path": "embedding",
+                "queryVector": query_vector,
+                "numCandidates": 50,
+                "limit": 10
+            }
+        })
+    else:
+        
+        pipeline.append({"$match": {"domain": domain}})
+        pipeline.append({"$sample": {"size": 10}})
 
-        if not candidates:
-            # Fallback: Busca un ítem aleatorio del dominio que no se haya mostrado
-            fallback_candidates = items_df[(items_df["domain"] == domain) & (~items_df["itemId"].isin(shown))]
-            if not fallback_candidates.empty:
-                row = fallback_candidates.sample(1).iloc[0]
-                return row_to_recitem(row, distance=0.0)
-            # Si no hay absolutamente nada más que mostrar, entonces sí termina.
-            return None
-        cut = max(1, int(len(candidates) * 0.7))
-        close = candidates[:cut]
-        far = candidates[cut:]
-        pool = list(close)
-        if far:
-            pool += random.sample(far, min(3, len(far)))
-        n_idx, _ = random.choice(pool)
-        row = items_df.iloc[n_idx]
-        return row_to_recitem(row, distance=0.0)
+    # Filtros obligatorios
+    pipeline.append({
+        "$match": {
+            "domain": domain,
+            "itemId": {"$nin": list(shown)}
+        }
+    })
+    
+    pipeline.append({"$project": {"embedding": 0}})
+    pipeline.append({"$limit": 1})
 
-    elif last_feedback < 0:  # 👎 Dislike
-        vec = embeds[idx]
-        all_ids = np.arange(len(embeds))
-        dists = np.linalg.norm(embeds - vec, axis=1)
-        farthest = all_ids[np.argsort(-dists)]
-        for n_idx in farthest:
-            row = items_df.iloc[n_idx]
-            if row["domain"] == domain and row["itemId"] not in shown:
-                return row_to_recitem(row, distance=0.0)
-        return None
-
-    else:  # feedback == 0 (neutro, semilla inicial)
-        neigh_idxs, _ = ann_index.get_nns_by_item(idx, 20, include_distances=True)
-        for n_idx in neigh_idxs[1:]:
-            row = items_df.iloc[n_idx]
-            if row["domain"] == domain and row["itemId"] not in shown:
-                return row_to_recitem(row, distance=0.0)
-        return None
+    results = list(items_col.aggregate(pipeline))
+    if results:
+        return row_to_recitem(results[0], distance=0.0)
+    
+    return None
 
 def _get_quality_score(row: pd.Series) -> float:
     domain = row.get("domain")
@@ -493,235 +527,159 @@ def _get_quality_score(row: pd.Series) -> float:
         return float(_col(row, "playcount", 0.0) or 0.0)
     return 0.0
 
-def generate_diverse_recommendations(seen_items: List[str], top_per_domain: int = 5):
-    df = items_df.copy()
-    df = df[~df["itemId"].isin(seen_items)]
-    if df.empty:
-        return []
-    df["quality_score"] = df.apply(_get_quality_score, axis=1)
-    base_score = df["base_score"] if "base_score" in df.columns else 1.0
-    df["boosted_score"] = base_score * (1 + df["quality_score"] / 10.0)
-    recommendations = []
-    for domain, group in df.groupby("domain"):
-        top_items = group.nlargest(top_per_domain, "boosted_score")
-        for _, row in top_items.iterrows():
-            recommendations.append(
-                RecItem(item_id=row["itemId"], title=row["title"], distance=0.0, image_url=row.get("image_url"))
-            )
-    return recommendations
+# def generate_diverse_recommendations(seen_items: List[str], top_per_domain: int = 5):
+#     df = items_df.copy()
+#     df = df[~df["itemId"].isin(seen_items)]
+#     if df.empty:
+#         return []
+#     df["quality_score"] = df.apply(_get_quality_score, axis=1)
+#     base_score = df["base_score"] if "base_score" in df.columns else 1.0
+#     df["boosted_score"] = base_score * (1 + df["quality_score"] / 10.0)
+#     recommendations = []
+#     for domain, group in df.groupby("domain"):
+#         top_items = group.nlargest(top_per_domain, "boosted_score")
+#         for _, row in top_items.iterrows():
+#             recommendations.append(
+#                 RecItem(item_id=row["itemId"], title=row["title"], distance=0.0, image_url=row.get("image_url"))
+#             )
+#     return recommendations
 
-def _collect_candidates(domain: str, shown: set, positives: List[str],
-                        k_neighbors: int = K_VECINOS, exploration_sample: int = EXPLORATION_SAMPLE) -> dict:
-    candidates = {}
-    # vecinos de positivos
-    for base in positives[-CONSIDER_LAST_POSITIVES:]:
-        idx = movieid_to_index.get(base)
-        if idx is None:
-            continue
-        neigh_idxs, dists = ann_index.get_nns_by_item(idx, k_neighbors, include_distances=True)
-        for n_idx, dist in zip(neigh_idxs[1:], dists[1:]):
-            row = items_df.iloc[n_idx]
-            if row["domain"] != domain:
-                continue
-            cid = row["itemId"]
-            if cid in shown:
-                continue
-            prev = candidates.get(cid)
-            if prev is None or dist < prev:
-                candidates[cid] = float(dist)
-    pool = items_df[(items_df["domain"] == domain) & (~items_df["itemId"].isin(shown))]
-    if not pool.empty:
-        sample = pool.sample(min(exploration_sample, len(pool)))
-        for _, row in sample.iterrows():
-            cid = row["itemId"]
-            # si no viene de vecinos damos una distancia alta para favorecer exploración
-            if cid not in candidates:
-                candidates[cid] = float(999.0)
-    return candidates
+# def _collect_candidates(domain: str, shown: set, positives: List[str],
+#                         k_neighbors: int = K_VECINOS, exploration_sample: int = EXPLORATION_SAMPLE) -> dict:
+#     candidates = {}
+#     # vecinos de positivos
+#     for base in positives[-CONSIDER_LAST_POSITIVES:]:
+#         idx = movieid_to_index.get(base)
+#         if idx is None:
+#             continue
+#         neigh_idxs, dists = ann_index.get_nns_by_item(idx, k_neighbors, include_distances=True)
+#         for n_idx, dist in zip(neigh_idxs[1:], dists[1:]):
+#             row = items_df.iloc[n_idx]
+#             if row["domain"] != domain:
+#                 continue
+#             cid = row["itemId"]
+#             if cid in shown:
+#                 continue
+#             prev = candidates.get(cid)
+#             if prev is None or dist < prev:
+#                 candidates[cid] = float(dist)
+#     pool = items_df[(items_df["domain"] == domain) & (~items_df["itemId"].isin(shown))]
+#     if not pool.empty:
+#         sample = pool.sample(min(exploration_sample, len(pool)))
+#         for _, row in sample.iterrows():
+#             cid = row["itemId"]
+#             # si no viene de vecinos damos una distancia alta para favorecer exploración
+#             if cid not in candidates:
+#                 candidates[cid] = float(999.0)
+#     return candidates
 
-def _score_and_rank_candidates(candidates: dict,
-                               alpha_sim: float = ALPHA_SIM,
-                               beta_pop: float = BETA_POP,
-                               gamma_imdb: float = GAMMA_IMDB) -> List[dict]:
-    scored = []
-    for cid, dist in candidates.items():
-        try:
-            row = items_df.loc[movieid_to_index[cid]]
-        except (ValueError, TypeError):
-            continue
-        sim_score = math.exp(-dist) if dist < 900 else 0.01
-        pop = _get_popularity(row)
-        imdb = float(_col(row, "imdb_score", 0.0)) / 10.0
-        raw = alpha_sim * sim_score + beta_pop * pop + gamma_imdb * imdb
-        scored.append({
-            "item_id": cid,
-            "score": raw,
-            "dist": dist,
-            "genres": _genres_to_set(_col(row, "genres", None)),
-            "row": row
-        })
-    scored.sort(key=lambda x: x["score"], reverse=True)
-    return scored
+# def _score_and_rank_candidates(candidates: dict,
+#                                alpha_sim: float = ALPHA_SIM,
+#                                beta_pop: float = BETA_POP,
+#                                gamma_imdb: float = GAMMA_IMDB) -> List[dict]:
+#     scored = []
+#     for cid, dist in candidates.items():
+#         try:
+#             row = items_df.loc[movieid_to_index[cid]]
+#         except (ValueError, TypeError):
+#             continue
+#         sim_score = math.exp(-dist) if dist < 900 else 0.01
+#         pop = _get_popularity(row)
+#         imdb = float(_col(row, "imdb_score", 0.0)) / 10.0
+#         raw = alpha_sim * sim_score + beta_pop * pop + gamma_imdb * imdb
+#         scored.append({
+#             "item_id": cid,
+#             "score": raw,
+#             "dist": dist,
+#             "genres": _genres_to_set(_col(row, "genres", None)),
+#             "row": row
+#         })
+#     scored.sort(key=lambda x: x["score"], reverse=True)
+#     return scored
 
-def build_final_grid(session_id: str,
-                     user_id: str,
-                     domain: str,
-                     history: List[Tuple[str, int]],
-                     target_n: int = TARGET_FINAL_N,
-                     diversity_threshold: float = DIVERSITY_JACCARD_THRESHOLD) -> List[RecItem]:
-    shown = {iid for iid, _ in history}
-    positives = [iid for iid, fb in history if fb > 0]
-    # --- 1) pool + scoring desde likes ---
-    candidates = _collect_candidates(domain, shown, positives)
-    scored = _score_and_rank_candidates(candidates)
-    # greedy con diversidad (tomamos hasta 12 de aquí)
-    picked_from_scored: List[str] = []
-    selected_genres = []
-    for c in scored:
-        if len(picked_from_scored) >= 12:
-            break
-        cand_gen = c["genres"]
-        max_j = 0.0
-        for sg in selected_genres:
-            max_j = max(max_j, jaccard(cand_gen, sg))
-        adjusted_score = c["score"] - DELTA_NOVELTY * max_j
-        if max_j < diversity_threshold or len(picked_from_scored) < 2:
-            picked_from_scored.append(c["item_id"])
-            selected_genres.append(cand_gen)
-        if adjusted_score > 0 and (max_j < diversity_threshold or len(picked_from_scored) < 2):
-            picked_from_scored.append(c["item_id"])
-            selected_genres.append(cand_gen)
+def build_final_grid(session_id: str, user_id: str, domain: str,
+                     history: List[Tuple[str, int]], target_n: int = 20, **kwargs) -> List[RecItem]:
+    
+    shown_ids = [iid for iid, _ in history]
+    positive_ids = [iid for iid, fb in history if fb > 0]
+    final_docs = []
+    
+    # 1. Recomendaciones Vectoriales (Basadas en el último Like)
+    if positive_ids:
+        last_like = positive_ids[-1]
+        seed_doc = items_col.find_one({"itemId": last_like}, {"embedding": 1})
+        if seed_doc and "embedding" in seed_doc:
+            pipeline = [
+                {
+                    "$vectorSearch": {
+                        "index": "vector_index",
+                        "path": "embedding",
+                        "queryVector": seed_doc["embedding"],
+                        "numCandidates": 100,
+                        "limit": 12
+                    }
+                },
+                {"$match": {"domain": domain, "itemId": {"$nin": shown_ids}}},
+                {"$project": {"embedding": 0}}
+            ]
+            final_docs.extend(list(items_col.aggregate(pipeline)))
 
-    # --- 2) hidden gems (alto rating + baja popularidad) ---
-    dom_df = items_df[(items_df["domain"] == domain) & (~items_df["itemId"].isin(shown))]
-    if dom_df.empty:
-        dom_df = items_df[items_df["domain"] == domain]
-    # heurísticas robustas
-    dom_df = dom_df.copy()
-    dom_df["__rating"] = dom_df.apply(_rating, axis=1)
-    dom_df["__pop"] = dom_df.apply(_get_popularity, axis=1)
-    dom_df["__rc"] = dom_df.apply(_rating_count, axis=1)
-    # thresholds dinámicos
-    pop_q20 = float(dom_df["__pop"].quantile(0.20)) if len(dom_df) > 0 else 0.0
-    rating_q75 = float(dom_df["__rating"].quantile(0.75)) if len(dom_df) > 0 else 4.0
-    hidden_mask = (dom_df["__rating"] >= rating_q75) & (dom_df["__pop"] <= pop_q20)
-    hidden_df = dom_df[hidden_mask]
-    hidden_ids = hidden_df["itemId"].tolist()
-    random.shuffle(hidden_ids)
-    hidden_ids = hidden_ids[:4]  # 4 hidden gems
-    rc_q25 = int(dom_df["__rc"].quantile(0.25)) if len(dom_df) > 0 else 10
-    und_mask = (dom_df["__rc"] <= max(5, rc_q25)) & (dom_df["__rating"] >= (rating_q75 * 0.75))
-    und_df = dom_df[und_mask]
-    underdog_ids = und_df["itemId"].tolist()
-    random.shuffle(underdog_ids)
-    underdog_ids = underdog_ids[:4]
-    # --- 4) combinar y rellenar ---
-    combined_ids = []
-    def _safe_extend(ids):
-        for iid in ids:
-            if iid not in combined_ids and iid not in shown:
-                combined_ids.append(iid)
-    _safe_extend(picked_from_scored)
-    _safe_extend(hidden_ids)
-    _safe_extend(underdog_ids)
-    # si faltan, rellenar con resto del dominio evitando repetidos y manteniendo diversidad suave
-    if len(combined_ids) < target_n:
-        need = target_n - len(combined_ids)
-        # tomar por score remanente primero, luego random del dominio
-        remaining_pool = [c["item_id"] for c in scored if c["item_id"] not in combined_ids]
-        if len(remaining_pool) < need:
-            extra_dom = dom_df[~dom_df["itemId"].isin(set(combined_ids) | shown)]["itemId"].tolist()
-            random.shuffle(extra_dom)
-            remaining_pool.extend(extra_dom)
-        remaining_pool = remaining_pool[:need]
-        _safe_extend(remaining_pool)
-    # recortar y randomizar orden final
-    final_ids = combined_ids[:target_n]
-    random.shuffle(final_ids)
+    # 2. Relleno "Joyas Ocultas" / Random (Simplificado)
+    # Buscamos items random del dominio que no hayamos visto ni seleccionado
+    current_ids = [d["itemId"] for d in final_docs] + shown_ids
+    needed = target_n - len(final_docs)
+    
+    if needed > 0:
+        fill_pipeline = [
+            {"$match": {"domain": domain, "itemId": {"$nin": current_ids}}},
+            {"$sample": {"size": needed}},
+            {"$project": {"embedding": 0}}
+        ]
+        final_docs.extend(list(items_col.aggregate(fill_pipeline)))
 
-    final_items_to_save = []
+    # 3. Procesar resultados finales
+    final_docs = final_docs[:target_n]
+    random.shuffle(final_docs)
+    
     final_rec_items = []
+    final_items_to_save = []
 
-    # Prepara el DataFrame para buscar solo los ítems necesarios
-    final_ids_set = set(final_ids)
-
-    # 1. Obtener todas las filas de ítems de una sola vez (más eficiente)
-    # Asumimos que la columna de IDs es "itemId"
-    final_items_df = items_df[items_df["itemId"].isin(final_ids_set)]
-
-    for iid in final_ids:
-        try:
-            # Aseguramos que 'row' es la Serie de Pandas correspondiente al ítem
-            row = final_items_df[final_items_df["itemId"] == iid].iloc[0]
-
-        except IndexError:
-            # Esto maneja el caso de que el ID no se encuentre en el DataFrame
-            logger.warning(f"Item ID {iid} not found in items_df during final grid build.")
-            continue  # Saltar este ítem si no se encuentra
-
-        # Utilizamos la función row_to_recitem y el model_dump
-        rec_item = row_to_recitem(row, distance=0.0)
+    for doc in final_docs:
+        rec_item = row_to_recitem(doc)
         final_rec_items.append(rec_item)
-
-        domain = row["domain"]  # Acceso seguro a la Serie de Pandas
+        
+        # Calcular Score aproximado
         score = 0.0
-
         try:
             if domain == "movie":
-                raw_score = row.get("imdb_score")
-
-                imdb_score = float(raw_score) if raw_score is not None and isinstance(raw_score, (int, float)) else 0.0
-                score = imdb_score / 2.0 if imdb_score else 0.0  # Escalando de 10 a 5
-
+                score = float(doc.get("imdb_score") or 0) / 2.0
             elif domain == "book":
-                # ✅ CORRECCIÓN: Acceso directo a la Serie de Pandas
-                raw_score = row.get("google_avg_rating")
-
-                # Conversión segura
-                score = float(raw_score) if raw_score is not None and isinstance(raw_score, (int, float)) else 0.0
-
+                score = float(doc.get("google_avg_rating") or 0)
             elif domain == "music":
-                # ✅ CORRECCIÓN: Acceso directo a la Serie de Pandas
-                raw_listeners = row.get("listeners")
-                listeners = float(raw_listeners) if raw_listeners is not None and isinstance(raw_listeners,
-                                                                                             (int, float)) else 1.0
-
-                if listeners <= 0: listeners = 1.0
-                score = math.log10(listeners)
-                score = min(5.0, score / 1.6)
-
-            if not math.isfinite(score):
-                score = 0.0
-
-        except Exception as score_e:
-            logger.error(f"Error calculating score for {iid} in {domain}: {score_e}")
+                listeners = float(doc.get("listeners") or 1)
+                score = min(5.0, math.log10(listeners) / 1.6)
+        except:
             score = 0.0
+            
+        item_data = rec_item.model_dump()
+        item_data["quality_score"] = round(score, 2)
+        # Añadir duración si es necesaria
+        final_items_to_save.append(item_data)
 
-        item_data_for_mongo = rec_item.model_dump()
-        item_data_for_mongo["quality_score"] = round(score, 2)
-        duration_hours = TIME_ESTIMATES.get(domain, 0.0)
-        item_data_for_mongo["duration_hours"] = round(duration_hours, 2)
-        final_items_to_save.append(item_data_for_mongo)
-        # ----------------------------------------------------
-        # ✅ 1. CALCULAR Y ALMACENAR EL PROMEDIO DE LA SESIÓN FINAL
-        # ----------------------------------------------------
-        total_quality = sum(item["quality_score"] for item in final_items_to_save)
-        count = len(final_items_to_save)
+    # Calcular promedio
+    avg_quality = 0.0
+    if final_items_to_save:
+        avg_quality = sum(x["quality_score"] for x in final_items_to_save) / len(final_items_to_save)
 
-        # Este es el promedio de calidad de los 20 ítems finales (el valor que quieres)
-        session_avg_quality = round(total_quality / count, 4) if count > 0 else 0.0
-
-        # persistir en la sesión (guardamos la lista con scores Y EL PROMEDIO)
-        sessions_col.update_one(
-            {"session_id": session_id},
-            {"$set": {
-                "final_grid": final_items_to_save,
-                "session_avg_quality_score": session_avg_quality  # 👈 NUEVO CAMPO CRUCIAL
-            }}
-        )
-    logger.info("build_final_grid user=%s session=%s domain=%s -> %d items (likes=%d, hidden=%d, underdogs=%d)",
-                user_id, session_id, domain, len(final_rec_items), len(positives), len(hidden_ids), len(underdog_ids))
-    # Devolvemos la lista original de RecItems (sin el score) a la app
+    # Guardar en Mongo
+    sessions_col.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "final_grid": final_items_to_save,
+            "session_avg_quality_score": round(avg_quality, 4)
+        }}
+    )
+    
     return final_rec_items
 # Constantes para estimación de tiempo en HORAS
 TIME_ESTIMATES = {
@@ -889,7 +847,6 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
         total_stats['total_hours_interacting'] += stats.time_stats.hours_interacting
         total_stats['total_hours_from_final_recs'] += stats.time_stats.hours_from_final_recs
 
-    # ✅ CORRECCIÓN: Evitar división por cero para el promedio global
     total_avg_quality_score = 0.0
     if total_sessions_with_scores > 0:
         total_avg_quality_score = total_sum_scores / total_sessions_with_scores
@@ -1001,9 +958,10 @@ def api_get_session(session_id: str, user_id: str = Depends(get_user_id_from_jwt
         raise HTTPException(404, "Session not found or unauthorized")
     last_item = None
     last_item_id = s.get("last_item_id")
-    if last_item_id and last_item_id in movieid_to_index:
-        row = items_df.loc[movieid_to_index[last_item_id]]
-        last_item = row_to_recitem(row, distance=0.0)
+    if last_item_id:
+        doc = items_col.find_one({"itemId": last_item_id})
+        if doc:
+            last_item = row_to_recitem(doc, distance=0.0)
     iterations = int(s.get("iterations", len(s.get("shown", [])) or 0))
     limit = int(s.get("limit", SESSION_ITER_LIMIT))
     finished = bool(s.get("finished", False) or (iterations >= limit))
@@ -1016,21 +974,24 @@ def api_get_session(session_id: str, user_id: str = Depends(get_user_id_from_jwt
         finished=finished
     )
 
+
 @app.post("/session/{session_id}/feedback", response_model=SeedResponse)
 def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = Depends(get_user_id_from_jwt)):
     s = get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
-    domain = s["domain"]
-    history = s.get("history", [])
-    shown: List[str] = list(s.get("shown", []))
-    limit = int(s.get("limit", SESSION_ITER_LIMIT))
-
-    # validar que el item pertenece al dominio y existe
-    if req.item_id not in movieid_to_index:
+    
+    # --- CAMBIO: Validación contra MongoDB ---
+    item_doc = items_col.find_one({"itemId": req.item_id})
+    if not item_doc:
         raise HTTPException(404, "Item no encontrado")
-    row = items_df.loc[movieid_to_index[req.item_id]]
-    if str(row["domain"]) != domain:
+
+    history = s.get("history", [])
+    limit = int(s.get("limit", SESSION_ITER_LIMIT))
+    shown: List[str] = list(s.get("shown", []))
+    domain = s["domain"]
+    # Usamos .get() porque es un diccionario
+    if str(item_doc.get("domain")) != domain:
         raise HTTPException(400, "El item no corresponde al dominio de la sesión")
     if not history or history[-1][0] != req.item_id or history[-1][1] != req.feedback:
         history.append((req.item_id, req.feedback))
@@ -1146,81 +1107,58 @@ def api_session_finalize(session_id: str, user_id: str = Depends(get_user_id_fro
     return FinalListResponse(**response_data)
 
 def search_items(query: str, limit: int = 20) -> List[SearchResultItem]:
-    """
-    Searches items_df for titles containing the query (case-insensitive).
-    Returns a list of matching items formatted as SearchResultItem.
-    """
-    if not query or len(query) < 2: # Basic validation
+    if not query or len(query) < 2:
         return []
 
-    # Case-insensitive search on the 'title' column
-    # We use .str.contains() for partial matches
-    matches = items_df[items_df['title'].str.contains(query, case=False, na=False)]
-
-    # Limit the number of results
-    matches = matches.head(limit)
+    # Búsqueda insensible a mayúsculas con Regex
+    cursor = items_col.find(
+        {"title": {"$regex": query, "$options": "i"}},
+        {"embedding": 0} # No traer vector
+    ).limit(limit)
 
     results = []
-    for _, row in matches.iterrows():
-        # Use row_to_recitem to get consistent image URL handling (incl. placeholders)
-        rec_item = row_to_recitem(row, distance=0.0) # distance is irrelevant here
+    for doc in cursor:
+        rec_item = row_to_recitem(doc)
         results.append(SearchResultItem(
-            item_id=row['itemId'],
-            title=row['title'],
-            domain=row['domain'],
-            image_url=rec_item.image_url # Get the potentially cleaned/fetched image URL
+            item_id=rec_item.item_id,
+            title=rec_item.title,
+            domain=doc.get("domain", "unknown"),
+            image_url=rec_item.image_url
         ))
     return results
 
 def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
-    """
-    Finds an item by its ID in items_df and returns detailed information.
-    """
-    # Find the row corresponding to the item_id
-    item_row = items_df[items_df['itemId'] == item_id]
+    # --- CAMBIO: Consulta directa a Mongo ---
+    doc = items_col.find_one({"itemId": item_id})
+    if not doc:
+        return None 
 
-    if item_row.empty:
-        return None # Item not found
-
-    row = item_row.iloc[0] # Get the first (and only) row as a Series
-
-    # Use row_to_recitem to get basic info + cleaned image URL
-    rec_item = row_to_recitem(row, distance=0.0)
-
-    # Extract additional details based on domain (adapt field names to YOUR dataset)
+    rec_item = row_to_recitem(doc, distance=0.0)
+    
+    # Adaptar extracción de géneros desde diccionario
     genres_list = None
-
-
-    genres_data = row.get("genres") # Assuming 'genres' column exists
+    genres_data = doc.get("genres")
     if isinstance(genres_data, str):
         genres_list = [g.strip() for g in genres_data.split('|') if g.strip()]
-    elif isinstance(genres_data, (list, np.ndarray)):
+    elif isinstance(genres_data, list):
          genres_list = [str(g).strip() for g in genres_data if str(g).strip()]
 
-    year_match = re.search(r"\((\d{4})\)", row['title'])
-    year = year_match.group(1) if year_match else row.get("year_str") # Reuse year extraction if available
+    # Regex sobre el título
+    year_match = re.search(r"\((\d{4})\)", doc.get('title', ''))
+    year = year_match.group(1) if year_match else doc.get("year_str")
 
-    # Build the detailed response
-    details = ItemDetailResponse(
+    return ItemDetailResponse(
         item_id=rec_item.item_id,
         title=rec_item.title,
         distance=rec_item.distance,
         image_url=rec_item.image_url,
         genres=genres_list,
         year=year,
-        # Add domain-specific fields if they exist in your items_df
-        artist=row.get("artist"), # Will be None if column doesn't exist or is empty
-        # Usa _safe_int porque lo cambiaste a Optional[int]
-        google_avg_rating=_safe_int(row.get("google_avg_rating")),
-
-        # Usa _safe_float para campos float
-        imdb_score=_safe_float(row.get("imdb_score")),
-
-        # Usa _safe_int para campos int
-        listeners=_safe_int(row.get("listeners"))
+        artist=doc.get("artist"),
+        google_avg_rating=_safe_int(doc.get("google_avg_rating")),
+        imdb_score=_safe_float(doc.get("imdb_score")),
+        listeners=_safe_int(doc.get("listeners"))
     )
-
-    return details
 
 
 @app.get("/search", response_model=SearchResponse)
@@ -1315,11 +1253,13 @@ def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str = Depen
     """Añade un item_id a una lista. Es 'idempotente' (no añade duplicados)."""
 
     # 1. Validar que el item existe
-    if req.item_id not in movieid_to_index:
-        raise HTTPException(status_code=404, detail="Item no encontrado en el catálogo")
+    # CORRECCIÓN: Usamos req.item_id en lugar de item_id a secas
+    if not items_col.find_one({"itemId": req.item_id}, {"_id": 1}):
+        raise HTTPException(404, "Item no encontrado")
 
     # 2. Añadir a la lista (usando $addToSet para evitar duplicados)
     try:
+        # CORRECCIÓN: Aquí también debes usar req.item_id
         result = user_lists_col.update_one(
             {"_id": ObjectId(list_id), "user_id": user_id},
             {"$addToSet": {"items": req.item_id}}
@@ -1340,7 +1280,6 @@ def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str = Depen
         item_count=len(updated_doc.get("items", []))
     )
 
-
 # --- ENDPOINTS ADICIONALES ---
 
 @app.get("/lists/{list_id}", response_model=UserListDetail)
@@ -1359,16 +1298,20 @@ def api_get_list_details(list_id: str, user_id: str = Depends(get_user_id_from_j
 
     # Buscamos los detalles de cada item_id
     for item_id in item_ids:
-        if item_id in movieid_to_index:
-            row = items_df.loc[movieid_to_index[item_id]]
-            rec_item = row_to_recitem(row, distance=0.0)  # Reutilizamos la función que ya obtiene imágenes
+        # 1. Buscamos el documento directamente en la colección de items
+        doc = items_col.find_one({"itemId": item_id})
+
+        # 2. Si MongoDB lo encuentra (doc no es None), lo procesamos
+        if doc:
+            rec_item = row_to_recitem(doc, distance=0.0)  # Tu función ya acepta dicts
             item_details_list.append(SearchResultItem(
                 item_id=rec_item.item_id,
                 title=rec_item.title,
-                domain=row.get("domain", "unknown"),
+                domain=doc.get("domain", "unknown"),
                 image_url=rec_item.image_url
             ))
 
+        # El retorno se mantiene igual
     return UserListDetail(
         list_id=str(list_doc["_id"]),
         name=list_doc.get("name"),
@@ -1385,13 +1328,12 @@ def api_update_list(list_id: str, req: ListUpdateRequest, user_id: str = Depends
     if not req.name or len(req.name) < 1:
         raise HTTPException(status_code=400, detail="El nombre de la lista no puede estar vacío")
 
-    # 🎯 CREA EL DICCIONARIO CON LOS 3 CAMPOS
+    #  CREA EL DICCIONARIO CON LOS 3 CAMPOS
     update_data = {
         "name": req.name,
         "icon_name": req.icon_name,
         "color_hex": req.color_hex
     }
-
     try:
         result = user_lists_col.update_one(
             {"_id": ObjectId(list_id), "user_id": user_id},
@@ -1404,7 +1346,6 @@ def api_update_list(list_id: str, req: ListUpdateRequest, user_id: str = Depends
         raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
 
     updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
-    # 🎯 DEVUELVE EL UserListBasic COMPLETO
     return UserListBasic(
         list_id=str(updated_doc["_id"]),
         name=updated_doc.get("name"),
@@ -1519,7 +1460,6 @@ def api_unarchive_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt
     try:
         result = user_lists_col.update_one(
             {"_id": ObjectId(list_id), "user_id": user_id},
-            # Puedes usar $set o $unset, $set es más simple si siempre existe
             {"$set": {"is_archived": False}}
         )
     except Exception:
@@ -1543,8 +1483,8 @@ def api_unarchive_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt
 @app.post("/favorites/{item_id}", status_code=201) # 201 Created
 def api_add_favorite(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
     """Añade un item a los favoritos del usuario."""
-    if item_id not in movieid_to_index:
-        raise HTTPException(status_code=404, detail="Item no encontrado en el catálogo")
+    if not items_col.find_one({"itemId": item_id}, {"_id": 1}):
+        raise HTTPException(404, "Item no encontrado")
 
     now = datetime.now(timezone.utc)
     favorite_doc = {
@@ -1579,13 +1519,16 @@ def api_get_favorites(user_id: str = Depends(get_user_id_from_jwt)):
 
     results = []
     for item_id in favorite_item_ids:
-        if item_id in movieid_to_index:
-            row = items_df.loc[movieid_to_index[item_id]]
-            rec_item = row_to_recitem(row, distance=0.0)
+        # 1. Buscamos el documento directamente en la colección de items
+        doc = items_col.find_one({"itemId": item_id})
+
+        # 2. Si MongoDB lo encuentra (doc no es None), lo procesamos
+        if doc:
+            rec_item = row_to_recitem(doc, distance=0.0)
             results.append(SearchResultItem(
                 item_id=rec_item.item_id,
                 title=rec_item.title,
-                domain=row.get("domain", "unknown"),
+                domain=doc.get("domain", "unknown"),
                 image_url=rec_item.image_url
             ))
     return results
@@ -1607,29 +1550,24 @@ def api_session_randomize(session_id: str, user_id: str = Depends(get_user_id_fr
          raise HTTPException(400, "Session already finished")
 
     domain = s["domain"]
+    shown_in_session = s.get("shown", [])
     history = s.get("history", [])
-    shown_in_session: List[str] = list(s.get("shown", [])) # Items ya mostrados en ESTA sesión
+    exclude_ids = list(shown_in_session)
+    if history:
+        exclude_ids.append(history[-1][0])
     last_item_id = s.get("last_item_id")
-
-    # 1. Marcar el item actual en HISTORIAL como visto (feedback neutro 0)
-    if last_item_id and (not history or history[-1][0] != last_item_id):
-        history.append((last_item_id, 0))  # Añadir con feedback 0
-
-        # ❌ NO AÑADIR A 'shown' AQUÍ ❌
-        # if last_item_id not in shown_in_session:
-        #      shown_in_session.append(last_item_id) # <-- ELIMINAR ESTAS LÍNEAS
-
-    # 2. Buscar un nuevo candidato aleatorio
-    candidates_df = items_df[
-        (items_df["domain"] == domain) &
-        # Excluir los ya mostrados Y el que acabamos de saltar (que está en history[-1])
-        (~items_df["itemId"].isin(shown_in_session + ([history[-1][0]] if history else [])))
-        ]
-
-    if candidates_df.empty:
-        # No quedan items aleatorios por mostrar en este dominio para esta sesión
-        # Podríamos finalizar la sesión o devolver un error específico
-        # Por ahora, finalizamos la sesión
+    # Pipeline Random
+    pipeline = [
+        {"$match": {
+            "domain": s["domain"],
+            "itemId": {"$nin": exclude_ids}
+        }},
+        {"$sample": {"size": 1}},
+        {"$project": {"embedding": 0}}
+    ]
+    
+    results = list(items_col.aggregate(pipeline))
+    if not results:
         sessions_col.update_one(
             {"session_id": session_id},
             {"$set": {"finished": True, "history": history, "shown": shown_in_session}}
@@ -1638,12 +1576,8 @@ def api_session_randomize(session_id: str, user_id: str = Depends(get_user_id_fr
         return SeedResponse(seed_item=None) # Indica al frontend que terminó
 
     # 3. Seleccionar uno aleatorio y actualizar la sesión
-    new_random_row = candidates_df.sample(1).iloc[0]
-    new_seed = row_to_recitem(new_random_row, distance=0.0) # Distancia no aplica
-
-    # No añadimos el nuevo item a 'shown' ni 'history' todavía,
-    # solo actualizamos last_item_id. Se añadirá cuando el usuario interactúe
-    # o vuelva a randomizar. NO incrementamos 'iterations' aquí tampoco.
+    new_doc = results[0]
+    new_seed = row_to_recitem(new_doc)
     sessions_col.update_one(
         {"session_id": session_id},
         {"$set": {
