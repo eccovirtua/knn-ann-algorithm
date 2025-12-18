@@ -16,4 +16,4 @@ ENV PORT=8080
 
 # 5. Comando de arranque (Uvicorn)
 # Asegúrate de que 'recs_api' coincida con el nombre de tu archivo .py
-CMD ["uvicorn", "recs_api:app", "--host", "0.0.0.0", "--port", "8080"]
+CMD ["uvicorn", "services.recs_api:app", "--host", "0.0.0.0", "--port", "8080"]
