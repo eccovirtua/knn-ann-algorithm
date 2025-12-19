@@ -5,6 +5,8 @@ from fastapi import Response, Query
 from starlette.status import HTTP_204_NO_CONTENT
 from bson import ObjectId
 import sys
+import firebase_admin
+from firebase_admin import auth, credentials
 import logging
 from enum import Enum
 from uuid import uuid4
@@ -242,16 +244,28 @@ def _safe_int(value) -> Optional[int]:
         return int(f_val)
     except (ValueError, TypeError):
         return None
+
+# Inicializar Firebase Admin
+# En Cloud Run, esto detecta automáticamente las credenciales del proyecto
+if not firebase_admin._apps:
+    firebase_admin.initialize_app()
+
 def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+    """
+    Verifica el ID Token enviado desde Android usando Firebase Auth.
+    """
     token = credentials.credentials
     try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"])
-        user_id = payload.get("userId") or payload.get("sub")
-        if not user_id:
-            raise InvalidTokenError("Missing sub/userId")
-        return user_id
-    except InvalidTokenError:
-        raise HTTPException(status_code=401, detail="Token inválido o expirado")
+        # Firebase valida la firma, expiración y emisor por ti
+        decoded_token = auth.verify_id_token(token)
+        # El 'uid' es el identificador único y persistente del usuario en Firebase
+        return decoded_token['uid']
+    except Exception as e:
+        logger.error(f"Error de autenticación Firebase: {e}")
+        raise HTTPException(
+            status_code=401,
+            detail="Token de Firebase inválido o expirado"
+        )
 
 def _col(df: pd.Series, name: str, default):
     try:
@@ -526,76 +540,6 @@ def _get_quality_score(row: pd.Series) -> float:
     elif domain == "music":
         return float(_col(row, "playcount", 0.0) or 0.0)
     return 0.0
-
-# def generate_diverse_recommendations(seen_items: List[str], top_per_domain: int = 5):
-#     df = items_df.copy()
-#     df = df[~df["itemId"].isin(seen_items)]
-#     if df.empty:
-#         return []
-#     df["quality_score"] = df.apply(_get_quality_score, axis=1)
-#     base_score = df["base_score"] if "base_score" in df.columns else 1.0
-#     df["boosted_score"] = base_score * (1 + df["quality_score"] / 10.0)
-#     recommendations = []
-#     for domain, group in df.groupby("domain"):
-#         top_items = group.nlargest(top_per_domain, "boosted_score")
-#         for _, row in top_items.iterrows():
-#             recommendations.append(
-#                 RecItem(item_id=row["itemId"], title=row["title"], distance=0.0, image_url=row.get("image_url"))
-#             )
-#     return recommendations
-
-# def _collect_candidates(domain: str, shown: set, positives: List[str],
-#                         k_neighbors: int = K_VECINOS, exploration_sample: int = EXPLORATION_SAMPLE) -> dict:
-#     candidates = {}
-#     # vecinos de positivos
-#     for base in positives[-CONSIDER_LAST_POSITIVES:]:
-#         idx = movieid_to_index.get(base)
-#         if idx is None:
-#             continue
-#         neigh_idxs, dists = ann_index.get_nns_by_item(idx, k_neighbors, include_distances=True)
-#         for n_idx, dist in zip(neigh_idxs[1:], dists[1:]):
-#             row = items_df.iloc[n_idx]
-#             if row["domain"] != domain:
-#                 continue
-#             cid = row["itemId"]
-#             if cid in shown:
-#                 continue
-#             prev = candidates.get(cid)
-#             if prev is None or dist < prev:
-#                 candidates[cid] = float(dist)
-#     pool = items_df[(items_df["domain"] == domain) & (~items_df["itemId"].isin(shown))]
-#     if not pool.empty:
-#         sample = pool.sample(min(exploration_sample, len(pool)))
-#         for _, row in sample.iterrows():
-#             cid = row["itemId"]
-#             # si no viene de vecinos damos una distancia alta para favorecer exploración
-#             if cid not in candidates:
-#                 candidates[cid] = float(999.0)
-#     return candidates
-
-# def _score_and_rank_candidates(candidates: dict,
-#                                alpha_sim: float = ALPHA_SIM,
-#                                beta_pop: float = BETA_POP,
-#                                gamma_imdb: float = GAMMA_IMDB) -> List[dict]:
-#     scored = []
-#     for cid, dist in candidates.items():
-#         try:
-#             row = items_df.loc[movieid_to_index[cid]]
-#         except (ValueError, TypeError):
-#             continue
-#         sim_score = math.exp(-dist) if dist < 900 else 0.01
-#         pop = _get_popularity(row)
-#         imdb = float(_col(row, "imdb_score", 0.0)) / 10.0
-#         raw = alpha_sim * sim_score + beta_pop * pop + gamma_imdb * imdb
-#         scored.append({
-#             "item_id": cid,
-#             "score": raw,
-#             "dist": dist,
-#             "genres": _genres_to_set(_col(row, "genres", None)),
-#             "row": row
-#         })
-#     scored.sort(key=lambda x: x["score"], reverse=True)
-#     return scored
 
 def build_final_grid(session_id: str, user_id: str, domain: str,
                      history: List[Tuple[str, int]], target_n: int = 20, **kwargs) -> List[RecItem]:
