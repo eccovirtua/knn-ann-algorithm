@@ -219,6 +219,10 @@ class UserListDetail(UserListBasic):
     # Reutilizamos SearchResultItem para mostrar los items
     items: List[SearchResultItem]
 
+class UserProfileRequest(BaseModel):
+    age: int
+    name: str = ""
+
 def _safe_float(value) -> Optional[float]:
     """Convierte de forma segura a float, o devuelve None si falla o es NaN."""
     if pd.isna(value): # Esto captura None, np.nan, etc.
@@ -1534,6 +1538,33 @@ def api_session_randomize(session_id: str, user_id: str = Depends(get_user_id_fr
     logger.info(f"Randomized seed for session {session_id} to {new_seed.item_id}")
     return SeedResponse(seed_item=new_seed)
 
+
+@app.post("/users/profile")
+def create_or_update_profile(
+        profile_data: UserProfileRequest,
+        user_id: str = Depends(get_user_id_from_jwt)
+):
+    """
+    Guarda o actualiza la edad y nombre del usuario en MongoDB.
+    Se usa el UID de Firebase como la _id del documento.
+    """
+    try:
+        # Usamos la colección 'profiles' (o 'users' si prefieres)
+        # upsert=True crea el documento si no existe, o lo actualiza si ya existe.
+        db.users.update_one(
+            {"_id": user_id},
+            {"$set": {
+                "age": profile_data.age,
+                "name": profile_data.name,
+                "updated_at": datetime.utcnow()  # Opcional: para saber cuándo cambió
+            }},
+            upsert=True
+        )
+        return {"status": "success", "message": "Perfil guardado"}
+
+    except Exception as e:
+        print(f"Error DB: {e}")
+        raise HTTPException(status_code=500, detail="Error interno guardando perfil")
 @app.get("/health")
 def health():
     return {"status": "ok"}
