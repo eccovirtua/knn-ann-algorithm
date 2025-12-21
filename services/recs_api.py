@@ -65,6 +65,7 @@ session_feedback_col = db.get_collection("session_feedback")
 user_lists_col = db.get_collection("user_lists")
 user_favorites_col = db.get_collection("user_favorites")
 
+
 # índices defensivos
 try:
     user_favorites_col.create_index([("user_id", 1), ("item_id", 1)], unique=True) # <-- NUEVO ÍNDICE
@@ -222,6 +223,10 @@ class UserListDetail(UserListBasic):
 class UserProfileRequest(BaseModel):
     age: int
     name: str = ""
+
+# 1. Definimos el modelo de respuesta (lo que espera Android)
+class UserLookupResponse(BaseModel):
+    email: str
 
 def _safe_float(value) -> Optional[float]:
     """Convierte de forma segura a float, o devuelve None si falla o es NaN."""
@@ -1565,6 +1570,17 @@ def create_or_update_profile(
     except Exception as e:
         print(f"Error DB: {e}")
         raise HTTPException(status_code=500, detail="Error interno guardando perfil")
+
+@app.get("/users/get-email/{username}" , response_model = UserLookupResponse)
+async def get_email(username: str):
+    user = await db.users.find_one({"name": username})
+    if user:
+        return {"email": user["email"]}
+    else:
+        return {"error usuario no encontrado"}
+
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
