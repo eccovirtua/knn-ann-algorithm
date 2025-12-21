@@ -1573,7 +1573,7 @@ def create_or_update_profile(
 
 @app.get("/users/get-email/{username}" , response_model = UserLookupResponse)
 async def get_email(username: str):
-    user = await db.users.find_one({"name": username})
+    user = db.users.find_one({"name": username})
     if user:
         return {"email": user["email"]}
     else:
