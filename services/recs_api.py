@@ -2,11 +2,10 @@
 import os
 import re
 from fastapi import Response, Query
-from starlette.status import HTTP_204_NO_CONTENT
 from bson import ObjectId
 import sys
 import firebase_admin
-from firebase_admin import auth, credentials
+from firebase_admin import auth
 import logging
 from enum import Enum
 from uuid import uuid4
@@ -20,9 +19,7 @@ from pydantic import BaseModel
 from datetime import datetime, timezone
 import random
 import pandas as pd
-from pymongo import MongoClient
-import jwt
-from jwt.exceptions import InvalidTokenError
+from motor.motor_asyncio import AsyncIOMotorClient
 import asyncio
 from services import tmdb_api
 from services.tmdb_api import fetch_movie_poster
@@ -57,8 +54,8 @@ app.include_router(tmdb_api.router, prefix="/external", tags=["External APIs"])
 security = HTTPBearer()
 
 # ---------- Mongo (colecciones) ----------
-mongo = MongoClient(MONGO_URI)
-db = mongo.get_database()
+client = AsyncIOMotorClient(MONGO_URI)
+db = client.get_database()
 feedback_col = db.get_collection("feedback")
 sessions_col = db.get_collection("sessions")
 session_feedback_col = db.get_collection("session_feedback")
@@ -228,6 +225,13 @@ class UserProfileRequest(BaseModel):
 class UserLookupResponse(BaseModel):
     email: str
 
+class UserCreate(BaseModel):
+    username: str
+    email: str
+    age: int
+    firebaseUid: str
+
+
 def _safe_float(value) -> Optional[float]:
     """Convierte de forma segura a float, o devuelve None si falla o es NaN."""
     if pd.isna(value): # Esto captura None, np.nan, etc.
@@ -254,12 +258,32 @@ def _safe_int(value) -> Optional[int]:
     except (ValueError, TypeError):
         return None
 
-# Inicializar Firebase Admin
-# En Cloud Run, esto detecta automáticamente las credenciales del proyecto
-if not firebase_admin._apps:
+# Forma correcta de inicializar Firebase sin tocar variables privadas
+try:
+    # Intentamos obtener la app por defecto
+    firebase_admin.get_app()
+except ValueError:
+    # Si falla (ValueError), significa que no existe, así que la inicializamos
     firebase_admin.initialize_app()
 
-def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+
+async def _get_list_and_map_to_basic(list_id: str) -> UserListBasic:
+    """Helper para buscar una lista por ID y devolver el modelo básico."""
+    updated_doc = await user_lists_col.find_one({"_id": ObjectId(list_id)})
+
+    if not updated_doc:
+        # Esto es un fallback por seguridad
+        raise HTTPException(status_code=404, detail="Lista no encontrada tras actualización")
+
+    return UserListBasic(
+        list_id=str(updated_doc["_id"]),
+        name=updated_doc.get("name"),
+        icon_name=updated_doc.get("icon_name", "default"),
+        color_hex=updated_doc.get("color_hex", "#FFFFFF"),
+        item_count=len(updated_doc.get("items", []))
+    )
+
+async def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """
     Verifica el ID Token enviado desde Android usando Firebase Auth.
     """
@@ -269,12 +293,27 @@ def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(sec
         decoded_token = auth.verify_id_token(token)
         # El 'uid' es el identificador único y persistente del usuario en Firebase
         return decoded_token['uid']
-    except Exception as e:
-        logger.error(f"Error de autenticación Firebase: {e}")
+    except Exception as err:
+        logger.error(f"Error de autenticación Firebase: {err}")
         raise HTTPException(
             status_code=401,
             detail="Token de Firebase inválido o expirado"
         )
+async def _set_list_archive_status(list_id: str, user_id: str, archive: bool) -> UserListBasic:
+    """Helper para cambiar el estado de archivo de una lista."""
+    try:
+        result = await user_lists_col.update_one(
+            {"_id": ObjectId(list_id), "user_id": user_id},
+            {"$set": {"is_archived": archive}}
+        )
+    except Exception:
+        raise HTTPException(status_code=400, detail="ID de lista inválido")
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
+
+    # Reutilizamos el helper de mapeo que creamos en la pregunta anterior
+    return await _get_list_and_map_to_basic(list_id)
 
 def _col(df: pd.Series, name: str, default):
     try:
@@ -291,9 +330,12 @@ def save_feedback(user_id: str, domain: str, item_id: str, feedback: int):
         {"$set": {"feedback": feedback, "ts": now}},
         upsert=True,
     )
-def get_history(user_id: str, domain: str) -> List[Tuple[str, int]]:
-    docs = feedback_col.find({"user_id": user_id, "domain": domain}).sort("ts", 1)
+async def get_history(user_id: str, domain: str) -> List[Tuple[str, int]]:
+    # Motor: cursor.to_list(length=None) para traer todo
+    cursor = feedback_col.find({"user_id": user_id, "domain": domain}).sort("ts", 1)
+    docs = await cursor.to_list(length=None)
     return [(d["item_id"], d["feedback"]) for d in docs]
+
 def clear_history(user_id: str, domain: str):
     feedback_col.delete_many({"user_id": user_id, "domain": domain})
 
@@ -420,95 +462,58 @@ def _rating_count(row: pd.Series) -> int:
     return 0
 
 # Core algorithm
-def generate_new_seed(domain: str) -> RecItem:
-
+async def generate_new_seed(domain: str) -> RecItem:
     pipeline = [
         {"$match": {"domain": domain}},
         {"$sample": {"size": 1}}
     ]
-    results = list(items_col.aggregate(pipeline))
+    # Motor: aggregate devuelve un cursor asíncrono
+    cursor = items_col.aggregate(pipeline)
+    results = await cursor.to_list(length=1)
+
     if not results:
         raise HTTPException(404, "No hay items para el dominio")
+
     return row_to_recitem(results[0], distance=0.0)
 
-def compute_next_seed(user_id: str, domain: str) -> Optional[RecItem]:
-    history = get_history(user_id, domain)
+
+async def compute_next_seed(domain: str, user_id: str = None, session_history: List[Tuple[str, int]] = None) -> \
+Optional[RecItem]:
+    """
+    Calcula el siguiente item semilla.
+    Puede usar un historial pasado explícitamente O buscarlo en BD usando user_id.
+    """
+    history = session_history
+
+    # Si no nos dan historial, pero sí usuario, lo buscamos
+    if history is None and user_id:
+        history = await get_history(user_id, domain)
+
+    if not history:
+        history = []
+
     shown = {item for item, _ in history}
-    
+
     # 1. Buscar el último ítem positivo (Like)
     last_positive_id = None
     for item_id, feedback in reversed(history):
         if feedback > 0:
             last_positive_id = item_id
             break
-            
+
     query_vector = None
-    
-    # 2. Si hay positivo, obtenemos su vector desde Mongo para buscar similares
+
+    # 2. Obtener vector del último like (si existe)
     if last_positive_id:
-        seed_doc = items_col.find_one({"itemId": last_positive_id}, {"embedding": 1})
+        seed_doc = await items_col.find_one({"itemId": last_positive_id}, {"embedding": 1})
         if seed_doc and "embedding" in seed_doc:
             query_vector = seed_doc["embedding"]
 
     # 3. Construir Pipeline
     pipeline = []
-    
+
     if query_vector:
-        # A) Búsqueda Vectorial (Si tenemos un like previo)
-        pipeline.append({
-            "$vectorSearch": {
-                "index": "vector_index", #index name
-                "path": "embedding",
-                "queryVector": query_vector,
-                "numCandidates": 50,
-                "limit": 10
-            }
-        })
-    else:
-        # B) Muestreo Aleatorio (Si no hay historial o likes)
-        # Random del mismo dominio
-        pipeline.append({"$match": {"domain": domain}})
-        pipeline.append({"$sample": {"size": 10}})
-
-    # 4. Filtrar lo ya visto y el dominio (si usamos vectorSearch)
-    pipeline.append({
-        "$match": {
-            "domain": domain,
-            "itemId": {"$nin": list(shown)} # Excluir lo visto
-        }
-    })
-    
-    # 5. Proyección (No traemos el vector gigante de vuelta)
-    pipeline.append({"$project": {"embedding": 0}})
-    pipeline.append({"$limit": 1}) # Solo necesitamos 1 candidato
-
-    results = list(items_col.aggregate(pipeline))
-    
-    if results:
-        # Convertir resultado de Mongo a tu objeto RecItem
-        return row_to_recitem(results[0], distance=0.0)
-        
-    return None
-
-def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domain: str) -> Optional[RecItem]:
-    if not session_history:
-        return None
-
-    shown = {item for item, _ in session_history}
-    last_item_id, last_feedback = session_history[-1]
-    
-    query_vector = None
-
-    # ESTRATEGIA: Si hubo Like, buscamos similares vectoriales
-    if last_feedback > 0:
-        seed_doc = items_col.find_one({"itemId": last_item_id}, {"embedding": 1})
-        if seed_doc and "embedding" in seed_doc:
-            query_vector = seed_doc["embedding"]
-    
-    pipeline = []
-    
-    if query_vector:
-        # Búsqueda por Similitud
+        # A) Búsqueda Vectorial
         pipeline.append({
             "$vectorSearch": {
                 "index": "vector_index",
@@ -519,48 +524,67 @@ def compute_next_seed_from_history(session_history: List[Tuple[str, int]], domai
             }
         })
     else:
-        
+        # B) Random del dominio (Cold start o sin likes recientes)
         pipeline.append({"$match": {"domain": domain}})
         pipeline.append({"$sample": {"size": 10}})
 
-    # Filtros obligatorios
+    # 4. Filtrar vistos y dominio
     pipeline.append({
         "$match": {
             "domain": domain,
             "itemId": {"$nin": list(shown)}
         }
     })
-    
+
     pipeline.append({"$project": {"embedding": 0}})
     pipeline.append({"$limit": 1})
 
-    results = list(items_col.aggregate(pipeline))
+    cursor = items_col.aggregate(pipeline)
+    results = await cursor.to_list(length=1)
+
     if results:
         return row_to_recitem(results[0], distance=0.0)
-    
+
     return None
 
-def _get_quality_score(row: pd.Series) -> float:
-    domain = row.get("domain")
-    if domain == "movie":
-        return float(_col(row, "imdb_score", 0.0) or 0.0)
-    elif domain == "book":
-        return float(_col(row, "google_rating", 0.0) or 0.0)
-    elif domain == "music":
-        return float(_col(row, "playcount", 0.0) or 0.0)
-    return 0.0
+def _calculate_quality_score(doc: dict, domain: str) -> float:
+    """Calcula el score de calidad basado en el dominio."""
+    score = 0.0
+    try:
+        if domain == "movie":
+            # Normalizar de 1-10 a 0-5
+            # float() lanzará ValueError si el string no es un número
+            score = float(doc.get("imdb_score") or 0) / 2.0
+        elif domain == "book":
+            # Google books suele ser 1-5
+            score = float(doc.get("google_avg_rating") or 0)
+        elif domain == "music":
+            # Logaritmo de listeners para normalizar popularidad
+            listeners = float(doc.get("listeners") or 1)
+            # Aseguramos que listeners sea al menos 1 para evitar log10(0) o error matemático
+            if listeners < 1:
+                listeners = 1.0
+            score = min(5.0, math.log10(listeners) / 1.6)
 
-def build_final_grid(session_id: str, user_id: str, domain: str,
-                     history: List[Tuple[str, int]], target_n: int = 20, **kwargs) -> List[RecItem]:
-    
+    except (ValueError, TypeError):
+        score = 0.0
+
+    return round(score, 2)
+
+
+async def build_final_grid(session_id: str, user_id: str, domain: str,
+                           history: List[Tuple[str, int]], target_n: int = 20) -> List[RecItem]:
     shown_ids = [iid for iid, _ in history]
+    # Filtramos solo los IDs que tuvieron feedback positivo
     positive_ids = [iid for iid, fb in history if fb > 0]
+
     final_docs = []
-    
-    # 1. Recomendaciones Vectoriales (Basadas en el último Like)
+
+    # 1. Recomendaciones Vectoriales (Si hay likes previos)
     if positive_ids:
         last_like = positive_ids[-1]
-        seed_doc = items_col.find_one({"itemId": last_like}, {"embedding": 1})
+        seed_doc = await items_col.find_one({"itemId": last_like}, {"embedding": 1})
+
         if seed_doc and "embedding" in seed_doc:
             pipeline = [
                 {
@@ -568,71 +592,66 @@ def build_final_grid(session_id: str, user_id: str, domain: str,
                         "index": "vector_index",
                         "path": "embedding",
                         "queryVector": seed_doc["embedding"],
-                        "numCandidates": 100,
-                        "limit": 12
+                        "numCandidates": 100,  # Aumentado para tener variedad
+                        "limit": 12  # Intentamos llenar un 60% con recomendaciones inteligentes
                     }
                 },
                 {"$match": {"domain": domain, "itemId": {"$nin": shown_ids}}},
                 {"$project": {"embedding": 0}}
             ]
-            final_docs.extend(list(items_col.aggregate(pipeline)))
+            cursor = items_col.aggregate(pipeline)
+            final_docs.extend(await cursor.to_list(length=None))
 
-    # 2. Relleno "Joyas Ocultas" / Random (Simplificado)
-    # Buscamos items random del dominio que no hayamos visto ni seleccionado
+    # 2. Relleno "Joyas Ocultas" / Random
+    # Calculamos cuántos faltan para llegar a target_n
     current_ids = [d["itemId"] for d in final_docs] + shown_ids
     needed = target_n - len(final_docs)
-    
+
     if needed > 0:
         fill_pipeline = [
             {"$match": {"domain": domain, "itemId": {"$nin": current_ids}}},
             {"$sample": {"size": needed}},
             {"$project": {"embedding": 0}}
         ]
-        final_docs.extend(list(items_col.aggregate(fill_pipeline)))
+        cursor = items_col.aggregate(fill_pipeline)
+        final_docs.extend(await cursor.to_list(length=None))
 
     # 3. Procesar resultados finales
+    # Recortar si nos pasamos y mezclar para que no salgan ordenados por similitud exacta siempre
     final_docs = final_docs[:target_n]
     random.shuffle(final_docs)
-    
+
     final_rec_items = []
     final_items_to_save = []
 
     for doc in final_docs:
+        # Convertir a objeto Pydantic
         rec_item = row_to_recitem(doc)
-        final_rec_items.append(rec_item)
-        
-        # Calcular Score aproximado
-        score = 0.0
-        try:
-            if domain == "movie":
-                score = float(doc.get("imdb_score") or 0) / 2.0
-            elif domain == "book":
-                score = float(doc.get("google_avg_rating") or 0)
-            elif domain == "music":
-                listeners = float(doc.get("listeners") or 1)
-                score = min(5.0, math.log10(listeners) / 1.6)
-        except:
-            score = 0.0
-            
+
+        # Calcular Score usando la función auxiliar
+        score = _calculate_quality_score(doc, domain)
+
+        # Preparar datos para guardar
         item_data = rec_item.model_dump()
-        item_data["quality_score"] = round(score, 2)
-        # Añadir duración si es necesaria
+        item_data["quality_score"] = score
+
+        final_rec_items.append(rec_item)
         final_items_to_save.append(item_data)
 
-    # Calcular promedio
+    # Calcular promedio de la sesión
     avg_quality = 0.0
     if final_items_to_save:
         avg_quality = sum(x["quality_score"] for x in final_items_to_save) / len(final_items_to_save)
 
-    # Guardar en Mongo
-    sessions_col.update_one(
-        {"session_id": session_id},
+    # 4. Guardar en Mongo (Update asíncrono)
+    await sessions_col.update_one(
+        {"session_id": session_id, "user_id": user_id},
         {"$set": {
             "final_grid": final_items_to_save,
             "session_avg_quality_score": round(avg_quality, 4)
         }}
     )
-    
+
     return final_rec_items
 # Constantes para estimación de tiempo en HORAS
 TIME_ESTIMATES = {
@@ -641,13 +660,15 @@ TIME_ESTIMATES = {
     "music": 0.058,  # 3.5 minutos en promedio por canción
     "interaction_seconds": 30 / 3600  # 30 segundos por interacción, convertido a horas
 }
+# --- HELPER NECESARIO ---
+async def get_session(session_id: str) -> dict:
+    """Helper asíncrono para buscar sesión."""
+    return await sessions_col.find_one({"session_id": session_id})
 
-def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
-    # 1. Pipeline de Agregación de MongoDB
+async def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
+    # 1. Pipeline de Agregación (El pipeline JSON se mantiene idéntico)
     pipeline = [
-        {
-            '$match': {'user_id': user_id}
-        },
+        {'$match': {'user_id': user_id}},
         {
             '$addFields': {
                 'history_processed': {
@@ -662,13 +683,11 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                                         '$cond': [
                                             {'$eq': [{'$type': '$$feedback_target'}, 'object']},
                                             {'$toInt': {'$let': {
-                                                'vars': {'feedback_obj': {
-                                                    '$arrayElemAt': [{'$objectToArray': '$$feedback_target'}, 0]}},
+                                                'vars': {'feedback_obj': {'$arrayElemAt': [{'$objectToArray': '$$feedback_target'}, 0]}},
                                                 'in': '$$feedback_obj.v'
                                             }}},
                                             {'$cond': [
-                                                {'$in': [{'$type': '$$feedback_target'},
-                                                         ['array', 'null', 'undefined']]},
+                                                {'$in': [{'$type': '$$feedback_target'}, ['array', 'null', 'undefined']]},
                                                 0,
                                                 {'$toInt': '$$feedback_target'}
                                             ]}
@@ -686,10 +705,7 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
             '$addFields': {
                 'avg_grid_score': {
                     '$cond': [
-                        {'$and': [
-                            '$finished',
-                            {'$gt': [{'$size': {'$ifNull': ['$final_grid', []]}}, 0]}
-                        ]},
+                        {'$and': ['$finished', {'$gt': [{'$size': {'$ifNull': ['$final_grid', []]}}, 0]}]},
                         {'$avg': '$final_grid.quality_score'},
                         None
                     ]
@@ -697,13 +713,11 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
             }
         },
         {
-
             '$group': {
                 '_id': '$domain',
                 'total_sessions': {'$sum': 1},
                 'finished_sessions': {'$sum': {'$cond': ['$finished', 1, 0]}},
                 'total_items_shown': {'$sum': {'$size': {'$ifNull': ['$history_processed', []]}}},
-
                 'items_liked': {
                     '$sum': {
                         '$size': {
@@ -728,11 +742,7 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                 },
                 'final_recs_generated': {
                     '$sum': {
-                        '$cond': [
-                            '$finished',
-                            {'$size': {'$ifNull': ['$final_grid', []]}},
-                            0
-                        ]
+                        '$cond': ['$finished', {'$size': {'$ifNull': ['$final_grid', []]}}, 0]
                     }
                 },
                 'sum_of_avg_scores': {'$sum': '$avg_grid_score'},
@@ -740,7 +750,12 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
             }
         }
     ]
-    results = list(sessions_col.aggregate(pipeline))
+
+    # --- CAMBIO MOTOR: Ejecución asíncrona del pipeline ---
+    cursor = sessions_col.aggregate(pipeline)
+    results = await cursor.to_list(length=None)
+
+    # El procesamiento de datos en Python se mantiene igual (CPU bound)
     domain_stats_map: Dict[str, DomainStats] = {
         "movie": DomainStats(time_stats=TimeStats()),
         "book": DomainStats(time_stats=TimeStats()),
@@ -789,7 +804,6 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
                 )
             )
 
-    # 3. Calcular los totales globales
     for stats in domain_stats_map.values():
         total_stats['total_sessions'] += stats.total_sessions
         total_stats['finished_sessions'] += stats.finished_sessions
@@ -818,85 +832,75 @@ def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
         ),
         domain_stats=domain_stats_map
     )
+
 @app.get("/stats/dashboard", response_model=UserDashboardStats)
 def api_get_user_dashboard_stats(user_id: str = Depends(get_user_id_from_jwt)):
     return get_user_dashboard_stats(user_id)
 
 # ---------- Session endpoints (nuevo flujo) ----------
-def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
-
+async def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
     # 1. Obtener fecha UTC actual
     now = datetime.now(timezone.utc)
-    today_utc_str = now.strftime('%Y-%m-%d')  # Formato YYYY-MM-DD
+    today_utc_str = now.strftime('%Y-%m-%d')
 
-    daily_count = sessions_col.count_documents({
+    # --- CAMBIO MOTOR: Count asíncrono ---
+    daily_count = await sessions_col.count_documents({
         "user_id": user_id,
         "created_date_utc": today_utc_str
     })
 
     if daily_count >= SESSION_DAILY_LIMIT:
-        logger.warning(f"Límite diario alcanzado para usuario {user_id}. Count={daily_count}")
+        # logger.warning(...)
         raise HTTPException(
-            status_code=429,  # Too Many Requests
+            status_code=429,
             detail=f"Has alcanzado el límite de {SESSION_DAILY_LIMIT} sesiones por día."
         )
 
-
     session_id = str(uuid4())
-    seed = generate_new_seed(domain)
+
+    # --- CAMBIO MOTOR: Await porque generate_new_seed ahora es async ---
+    seed = await generate_new_seed(domain)
+
     now = datetime.now(timezone.utc)
-    sessions_col.insert_one({
+
+    # --- CAMBIO MOTOR: Insert asíncrono ---
+    await sessions_col.insert_one({
         "session_id": session_id,
         "user_id": user_id,
         "domain": domain,
         "created_at": now,
-        "created_date_utc": today_utc_str,  # Solo la fecha YYYY-MM-DD para contar
+        "created_date_utc": today_utc_str,
         "last_item_id": seed.item_id,
         "iterations": 0,
         "limit": SESSION_ITER_LIMIT,
         "finished": False,
-        "history": [(seed.item_id, 0)],  # guardamos la seed inicial como neutral
+        "history": [(seed.item_id, 0)],
         "shown": [seed.item_id]
     })
-    session_feedback_col.insert_one({"session_id": session_id, "item_id": seed.item_id, "feedback": 0, "ts": now})
+
+    await session_feedback_col.insert_one({
+        "session_id": session_id,
+        "item_id": seed.item_id,
+        "feedback": 0,
+        "ts": now
+    })
+
     return session_id, seed
 @app.get("/user/final-grid/{domain}", response_model=FinalListResponse)
-def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_user_id_from_jwt)):
-    # Buscar la última sesión finalizada del usuario en ese dominio
-    session = db.sessions.find_one(
-        {"user_id": user_id, "domain": domain, "finished": True},
-        sort=[("created_at", -1)]
-    )
+async def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_user_id_from_jwt)):
+    cursor = sessions_col.find(
+        {"user_id": user_id, "domain": domain, "finished": True}
+    ).sort("created_at", -1).limit(1)
+
+    # En motor para sacar solo uno de un cursor ordenado:
+    results = await cursor.to_list(length=1)
+    session = results[0] if results else None
+
     if not session or "final_grid" not in session:
         raise HTTPException(404, "No hay grid final para este usuario y dominio")
+
     recs = [RecItem(**item) for item in session["final_grid"]]
     return FinalListResponse(recommendations=recs)
-
-def get_session(session_id: str):
-    return sessions_col.find_one({"session_id": session_id})
-
-def get_session_history(session_id: str) -> List[Tuple[str, int]]:
-    s = get_session(session_id)
-    if not s:
-        return []
-    history = []
-    for x in s.get("history", []):
-        try:
-            item_id = str(x[0])
-            feedback = int(x[1])
-            history.append((item_id, feedback))
-        except (IndexError, ValueError, TypeError):
-            continue  # saltar elementos corruptos
-    return history
-def reset_session(session_id: str):
-    sessions_col.update_one({"session_id": session_id}, {"$set": {
-        "iterations": 0,
-        "finished": False,
-        "history": [],
-        "shown": [],
-        "final_grid": None
-    }})
-    session_feedback_col.delete_many({"session_id": session_id})
 
 @app.post("/session/{domain}/create", response_model=SessionCreateResponse)
 def api_create_session(domain: Domain, user_id: str = Depends(get_user_id_from_jwt)):
@@ -904,20 +908,26 @@ def api_create_session(domain: Domain, user_id: str = Depends(get_user_id_from_j
     session_id, seed = create_session(user_id, dom)
     return SessionCreateResponse(session_id=session_id, seed=seed)
 
+
 @app.get("/session/{session_id}", response_model=SessionStateResponse)
-def api_get_session(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    s = get_session(session_id)
+async def api_get_session(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    # --- CAMBIO MOTOR: Await get_session ---
+    s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
+
     last_item = None
     last_item_id = s.get("last_item_id")
     if last_item_id:
-        doc = items_col.find_one({"itemId": last_item_id})
+        # --- CAMBIO MOTOR: Await find_one ---
+        doc = await items_col.find_one({"itemId": last_item_id})
         if doc:
             last_item = row_to_recitem(doc, distance=0.0)
+
     iterations = int(s.get("iterations", len(s.get("shown", [])) or 0))
     limit = int(s.get("limit", SESSION_ITER_LIMIT))
     finished = bool(s.get("finished", False) or (iterations >= limit))
+
     return SessionStateResponse(
         session_id=session_id,
         domain=s["domain"],
@@ -929,13 +939,14 @@ def api_get_session(session_id: str, user_id: str = Depends(get_user_id_from_jwt
 
 
 @app.post("/session/{session_id}/feedback", response_model=SeedResponse)
-def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = Depends(get_user_id_from_jwt)):
-    s = get_session(session_id)
+async def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = Depends(get_user_id_from_jwt)):
+    # --- CAMBIO MOTOR: Await get_session ---
+    s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
-    
-    # --- CAMBIO: Validación contra MongoDB ---
-    item_doc = items_col.find_one({"itemId": req.item_id})
+
+    # --- CAMBIO MOTOR: Await find_one ---
+    item_doc = await items_col.find_one({"itemId": req.item_id})
     if not item_doc:
         raise HTTPException(404, "Item no encontrado")
 
@@ -943,17 +954,22 @@ def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = D
     limit = int(s.get("limit", SESSION_ITER_LIMIT))
     shown: List[str] = list(s.get("shown", []))
     domain = s["domain"]
-    # Usamos .get() porque es un diccionario
+
     if str(item_doc.get("domain")) != domain:
         raise HTTPException(400, "El item no corresponde al dominio de la sesión")
+
     if not history or history[-1][0] != req.item_id or history[-1][1] != req.feedback:
         history.append((req.item_id, req.feedback))
+
     if not shown or shown[-1] != req.item_id:
         shown.append(req.item_id)
-    iterations = len(shown)  # 1 ítem mostrado == 1 iteración
+
+    iterations = len(shown)
     finished = iterations >= limit
+
     if finished:
-        sessions_col.update_one(
+        # --- CAMBIO MOTOR: Await update_one ---
+        await sessions_col.update_one(
             {"session_id": session_id},
             {"$set": {
                 "history": history, "shown": shown,
@@ -961,38 +977,66 @@ def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = D
             }}
         )
         return SeedResponse(seed_item=None)
-    # si no terminó, calcular siguiente seed
-    new_seed = compute_next_seed_from_history(history, domain)
-    if not new_seed:
-        # si no hay candidatos, marcamos como terminada y el front pedirá el grid final
-        sessions_col.update_one(
-            {"session_id": session_id},
-            {"$set": {"history": history, "shown": shown, "iterations": iterations, "finished": True}}
-        )
-        return SeedResponse(seed_item=None)
-    sessions_col.update_one(
+
+    # Si no ha terminado, calculamos el siguiente item
+    # --- IMPORTANTE: Usamos la función refactorizada con historial explícito ---
+    next_item = await compute_next_seed(
+        domain=domain,
+        session_history=history  # Pasamos el historial para evitar otra query
+    )
+
+    if not next_item:
+        # Fallback si no hay next item
+        raise HTTPException(404, "No se pudo generar recomendación")
+
+    # Actualizamos DB
+    await sessions_col.update_one(
         {"session_id": session_id},
         {"$set": {
-            "history": history, "shown": shown, "iterations": iterations,
-            "last_item_id": new_seed.item_id, "finished": False
+            "history": history,
+            "shown": shown,
+            "last_item_id": next_item.item_id,
+            "iterations": iterations
         }}
     )
-    session_feedback_col.insert_one({"session_id": session_id, "item_id": req.item_id, "feedback": req.feedback, "ts": datetime.now(timezone.utc)})
-    return SeedResponse(seed_item=new_seed)
+
+    # Guardamos feedback individual
+    await session_feedback_col.insert_one({
+        "session_id": session_id,
+        "item_id": req.item_id,
+        "feedback": req.feedback,
+        "ts": datetime.now(timezone.utc)
+    })
+
+    return SeedResponse(seed_item=next_item)
+
+async def get_session_history(session_id: str) -> List[Tuple[str, int]]:
+    # --- CAMBIO MOTOR: Await get_session ---
+    s = await get_session(session_id)
+    if not s:
+        return []
+    history = []
+    for x in s.get("history", []):
+        try:
+            item_id = str(x[0])
+            feedback = int(x[1])
+            history.append((item_id, feedback))
+        except (IndexError, ValueError, TypeError):
+            continue
+    return history
+
 
 @app.post("/session/{session_id}/reset", response_model=SeedResponseWithSessionId)
-def api_session_reset(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    s = get_session(session_id)
+async def api_session_reset(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
-    # Generar un nuevo session_id
+
     new_session_id = str(uuid4())
-    # Reiniciar la sesión antigua en DB
-    reset_session(session_id)
-    # Generar seed para la nueva sesión
-    seed = generate_new_seed(s["domain"])
-    # Insertar nueva sesión en la DB con el nuevo session_id
-    sessions_col.insert_one({
+    await reset_session(session_id)
+    seed = await generate_new_seed(s["domain"])
+
+    await sessions_col.insert_one({
         "session_id": new_session_id,
         "user_id": user_id,
         "domain": s["domain"],
@@ -1004,73 +1048,41 @@ def api_session_reset(session_id: str, user_id: str = Depends(get_user_id_from_j
         "last_item_id": seed.item_id,
         "created_at": datetime.now(timezone.utc)
     })
-    session_feedback_col.insert_one({
+
+    await session_feedback_col.insert_one({
         "session_id": new_session_id,
         "item_id": seed.item_id,
         "feedback": 0,
         "ts": datetime.now(timezone.utc)
     })
+
     return SeedResponseWithSessionId(session_id=new_session_id, seed_item=seed)
 
-@app.get("/session/{session_id}/final-grid", response_model=FinalListResponse)
-def api_get_final_grid(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    s = get_session(session_id)
-    if not s or s["user_id"] != user_id:
-        raise HTTPException(404, "Session not found or unauthorized")
-    if not bool(s.get("finished", False)) and int(s.get("iterations", 0)) < int(s.get("limit", SESSION_ITER_LIMIT)):
-        raise HTTPException(400, "Session not finished yet")
-    # si ya existe final_grid → devolverlo
-    if "final_grid" in s and s["final_grid"]:
-        return FinalListResponse(recommendations=[RecItem(**i) for i in s["final_grid"]])
-    final_items = build_final_grid(
-        session_id=session_id,
-        user_id=user_id,
-        domain=s["domain"],
-        history = s.get("history", []),
-        target_n=TARGET_FINAL_N,
-        diversity_threshold=DIVERSITY_JACCARD_THRESHOLD
-    )
-    return FinalListResponse(recommendations=final_items)
-
-
-@app.post("/session/{session_id}/finalize", response_model=FinalListResponse)
-def api_session_finalize(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    s = get_session(session_id)
-    if not s or s["user_id"] != user_id:
-        raise HTTPException(404, "Session not found or unauthorized")
-
-
-    sessions_col.update_one(
+async def reset_session(session_id: str):
+    """Marca una sesión como terminada o reseteada en BD."""
+    # Asumimos que "resetear" significa marcar la vieja como terminada
+    # para que no interfiera, o simplemente dejarla abandonada.
+    await sessions_col.update_one(
         {"session_id": session_id},
-        {"$set": {"finished": True}}
+        {"$set": {"finished": True, "reset": True}}
     )
-    final_response: FinalListResponse = api_get_final_grid(session_id, user_id)
 
-    session_doc = sessions_col.find_one({"session_id": session_id})
-    if not session_doc:
-        raise HTTPException(500, "Session data missing after finalization.")
 
-    session_avg_quality = session_doc.get("session_avg_quality_score", 0.0)
-
-    response_data = final_response.model_dump()
-    response_data["session_avg_quality"] = session_avg_quality
-
-    # Opción 2: Usar .model_copy (Pydantic V2) o .copy(update={...}) (Pydantic V1)
-    # Usaremos la Opción 1 con la reconstrucción por seguridad:
-    return FinalListResponse(**response_data)
-
-def search_items(query: str, limit: int = 20) -> List[SearchResultItem]:
+async def search_items(query: str, limit: int = 20) -> List[SearchResultItem]:
     if not query or len(query) < 2:
         return []
 
-    # Búsqueda insensible a mayúsculas con Regex
+    # Motor: find devuelve un cursor
     cursor = items_col.find(
         {"title": {"$regex": query, "$options": "i"}},
-        {"embedding": 0} # No traer vector
+        {"embedding": 0}
     ).limit(limit)
 
+    # Motor: to_list para ejecutar la query
+    docs = await cursor.to_list(length=limit)
+
     results = []
-    for doc in cursor:
+    for doc in docs:
         rec_item = row_to_recitem(doc)
         results.append(SearchResultItem(
             item_id=rec_item.item_id,
@@ -1080,23 +1092,22 @@ def search_items(query: str, limit: int = 20) -> List[SearchResultItem]:
         ))
     return results
 
-def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
-    # --- CAMBIO: Consulta directa a Mongo ---
-    doc = items_col.find_one({"itemId": item_id})
+
+async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
+    # Motor: await find_one
+    doc = await items_col.find_one({"itemId": item_id})
     if not doc:
-        return None 
+        return None
 
     rec_item = row_to_recitem(doc, distance=0.0)
-    
-    # Adaptar extracción de géneros desde diccionario
+
     genres_list = None
     genres_data = doc.get("genres")
     if isinstance(genres_data, str):
         genres_list = [g.strip() for g in genres_data.split('|') if g.strip()]
     elif isinstance(genres_data, list):
-         genres_list = [str(g).strip() for g in genres_data if str(g).strip()]
+        genres_list = [str(g).strip() for g in genres_data if str(g).strip()]
 
-    # Regex sobre el título
     year_match = re.search(r"\((\d{4})\)", doc.get('title', ''))
     year = year_match.group(1) if year_match else doc.get("year_str")
 
@@ -1114,25 +1125,74 @@ def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
     )
 
 
+@app.get("/session/{session_id}/final-grid", response_model=FinalListResponse)
+async def api_get_final_grid(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    s = await get_session(session_id)
+    if not s or s["user_id"] != user_id:
+        raise HTTPException(404, "Session not found or unauthorized")
+
+    if not bool(s.get("finished", False)) and int(s.get("iterations", 0)) < int(s.get("limit", SESSION_ITER_LIMIT)):
+        raise HTTPException(400, "Session not finished yet")
+
+    if "final_grid" in s and s["final_grid"]:
+        return FinalListResponse(recommendations=[RecItem(**i) for i in s["final_grid"]])
+
+    # build_final_grid ahora es ASYNC (ver refactor anterior)
+    final_items = await build_final_grid(
+        session_id=session_id,
+        user_id=user_id,
+        domain=s["domain"],
+        history=s.get("history", []),
+        target_n=TARGET_FINAL_N
+    )
+
+    return FinalListResponse(recommendations=final_items)
+
+@app.post("/session/{session_id}/finalize", response_model=FinalListResponse)
+async def api_session_finalize(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    # 1. Validar sesión
+    s = await get_session(session_id)
+    if not s or s["user_id"] != user_id:
+        raise HTTPException(404, "Session not found or unauthorized")
+
+    # 2. Marcar finished
+    await sessions_col.update_one(
+        {"session_id": session_id},
+        {"$set": {"finished": True}}
+    )
+
+    # 3. Obtener grid (Genera recomendaciones y calcula scores internamente)
+    final_response: FinalListResponse = await api_get_final_grid(session_id, user_id)
+
+    # 4. Obtener el score actualizado
+    # Necesitamos consultar de nuevo porque api_get_final_grid actualizó el documento en segundo plano
+    session_doc = await sessions_col.find_one({"session_id": session_id})
+    if not session_doc:
+        raise HTTPException(500, "Session data missing after finalization.")
+
+    session_avg_quality = session_doc.get("session_avg_quality_score", 0.0)
+
+    # 5. Combinar respuesta
+    response_data = final_response.model_dump()
+    response_data["session_avg_quality"] = session_avg_quality
+
+    return FinalListResponse(**response_data)
+
 @app.get("/search", response_model=SearchResponse)
-def api_search_items(query: str, limit: int = 20, user_id: str = Depends(get_user_id_from_jwt)):
-    """
-    Endpoint to search for items by title query. Requires authentication.
-    """
+async def api_search_items(query: str, limit: int = 20):
     if len(query) < 3:
         raise HTTPException(status_code=400, detail="Query must be at least 3 characters long")
 
-    results = search_items(query, limit)
+    # search_items es async ahora
+    results = await search_items(query, limit)
     return SearchResponse(results=results)
-
 
 # ----------------------------------------
 # ENDPOINTS DE LISTAS DE USUARIO
 # ----------------------------------------
 
 @app.post("/lists", response_model=UserListBasic)
-def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_user_id_from_jwt)):
-    """Crea una nueva lista para el usuario."""
+async def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_user_id_from_jwt)):
     now = datetime.now(timezone.utc)
 
     if not req.name or len(req.name) < 1:
@@ -1147,51 +1207,48 @@ def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_user_id_f
         "items": []
     }
     try:
-        result = user_lists_col.insert_one(new_list)
+        # Motor: await insert_one
+        result = await user_lists_col.insert_one(new_list)
         return UserListBasic(
             list_id=str(result.inserted_id),
             name=req.name,
             item_count=0,
-
             icon_name=req.icon_name,
             color_hex=req.color_hex
         )
     except Exception as err:
         logger.error(f"Error al crear lista: {err}")
-        # Error 11000 es duplicado en Mongo
         if "E11000" in str(err):
             raise HTTPException(status_code=400, detail="Ya existe una lista con ese nombre")
         raise HTTPException(status_code=500, detail="Error interno al crear la lista")
 
 
 @app.get("/lists", response_model=List[UserListBasic])
-def api_get_my_lists(
-    archived: Optional[bool] = Query(None, description="Filtrar por estado archivado (true/false)"),
-    user_id: str = Depends(get_user_id_from_jwt)
+async def api_get_my_lists(
+        archived: Optional[bool] = Query(None),
+        user_id: str = Depends(get_user_id_from_jwt)
 ):
-    """Obtiene listas de un usuario, opcionalmente filtradas por estado archivado."""
-    # 🎯 Explicitly type the query dictionary to accept Any value type
     query: Dict[str, Any] = {"user_id": user_id}
 
-    if archived is True:
-        # If explicitly asking for archived, only get those where is_archived is true
+    if archived:
         query["is_archived"] = True
     elif archived is False:
-        # If explicitly asking for non-archived, get those where is_archived is false OR the field doesn't exist
         query["$or"] = [
             {"is_archived": False},
             {"is_archived": {"$exists": False}}
         ]
-    else:  # archived is None (default case when calling from UserProfileViewModel)
-        # Default: Get non-archived (is_archived is false OR field doesn't exist)
+    else:
         query["$or"] = [
             {"is_archived": False},
             {"is_archived": {"$exists": False}}
         ]
 
-    lists_cursor = user_lists_col.find(query).sort("created_at", -1)
+
+    cursor = user_lists_col.find(query).sort("created_at", -1)
+
     results = []
-    for list_doc in lists_cursor:
+
+    async for list_doc in cursor:
         results.append(UserListBasic(
             list_id=str(list_doc["_id"]),
             name=list_doc.get("name", "Lista sin nombre"),
@@ -1201,45 +1258,34 @@ def api_get_my_lists(
             is_archived=list_doc.get("is_archived", False)
         ))
     return results
-@app.post("/lists/{list_id}/items", response_model=UserListBasic)
-def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str = Depends(get_user_id_from_jwt)):
-    """Añade un item_id a una lista. Es 'idempotente' (no añade duplicados)."""
 
-    # 1. Validar que el item existe
-    # CORRECCIÓN: Usamos req.item_id en lugar de item_id a secas
-    if not items_col.find_one({"itemId": req.item_id}, {"_id": 1}):
+
+@app.post("/lists/{list_id}/items", response_model=UserListBasic)
+async def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str = Depends(get_user_id_from_jwt)):
+    # 1. Validar item
+    if not await items_col.find_one({"itemId": req.item_id}, {"_id": 1}):
         raise HTTPException(404, "Item no encontrado")
 
-    # 2. Añadir a la lista (usando $addToSet para evitar duplicados)
+    # 2. Update
     try:
-        # CORRECCIÓN: Aquí también debes usar req.item_id
-        result = user_lists_col.update_one(
+        result = await user_lists_col.update_one(
             {"_id": ObjectId(list_id), "user_id": user_id},
             {"$addToSet": {"items": req.item_id}}
         )
-    except Exception as err:
+    except Exception:
         raise HTTPException(status_code=400, detail="ID de lista inválido")
 
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
 
-    # 3. Devolver el estado actualizado de la lista
-    updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
-    return UserListBasic(
-        list_id=str(updated_doc["_id"]),
-        name=updated_doc.get("name"),
-        icon_name=updated_doc.get("icon_name", "default"),
-        color_hex=updated_doc.get("color_hex", "#FFFFFF"),
-        item_count=len(updated_doc.get("items", []))
-    )
-
-# --- ENDPOINTS ADICIONALES ---
+    # --- REUTILIZAMOS EL HELPER ---
+    return await _get_list_and_map_to_basic(list_id)
 
 @app.get("/lists/{list_id}", response_model=UserListDetail)
-def api_get_list_details(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    """Obtiene una lista específica, incluyendo todos sus items."""
+async def api_get_list_details(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
     try:
-        list_doc = user_lists_col.find_one({"_id": ObjectId(list_id), "user_id": user_id})
+        # Motor: await find_one
+        list_doc = await user_lists_col.find_one({"_id": ObjectId(list_id), "user_id": user_id})
     except Exception:
         raise HTTPException(status_code=400, detail="ID de lista inválido")
 
@@ -1249,14 +1295,17 @@ def api_get_list_details(list_id: str, user_id: str = Depends(get_user_id_from_j
     item_ids = list_doc.get("items", [])
     item_details_list = []
 
-    # Buscamos los detalles de cada item_id
-    for item_id in item_ids:
-        # 1. Buscamos el documento directamente en la colección de items
-        doc = items_col.find_one({"itemId": item_id})
+    # --- OPTIMIZACIÓN IMPORTANTE ---
+    # En lugar de hacer un bucle for con find_one (N+1 queries),
+    # usamos el operador $in para traerlos todos de una vez.
+    if item_ids:
+        cursor = items_col.find({"itemId": {"$in": item_ids}})
+        # Traemos todos los items de golpe
+        items_docs = await cursor.to_list(length=None)
 
-        # 2. Si MongoDB lo encuentra (doc no es None), lo procesamos
-        if doc:
-            rec_item = row_to_recitem(doc, distance=0.0)  # Tu función ya acepta dicts
+        # Mapeamos los resultados
+        for doc in items_docs:
+            rec_item = row_to_recitem(doc, distance=0.0)
             item_details_list.append(SearchResultItem(
                 item_id=rec_item.item_id,
                 title=rec_item.title,
@@ -1264,7 +1313,6 @@ def api_get_list_details(list_id: str, user_id: str = Depends(get_user_id_from_j
                 image_url=rec_item.image_url
             ))
 
-        # El retorno se mantiene igual
     return UserListDetail(
         list_id=str(list_doc["_id"]),
         name=list_doc.get("name"),
@@ -1276,21 +1324,18 @@ def api_get_list_details(list_id: str, user_id: str = Depends(get_user_id_from_j
 
 
 @app.put("/lists/{list_id}", response_model=UserListBasic)
-def api_update_list(list_id: str, req: ListUpdateRequest, user_id: str = Depends(get_user_id_from_jwt)):
-    """Actualiza nombre, icono y color de una lista."""  # <-- Descripción actualizada
+async def api_update_list(list_id: str, req: ListUpdateRequest, user_id: str = Depends(get_user_id_from_jwt)):
     if not req.name or len(req.name) < 1:
         raise HTTPException(status_code=400, detail="El nombre de la lista no puede estar vacío")
 
-    #  CREA EL DICCIONARIO CON LOS 3 CAMPOS
-    update_data = {
-        "name": req.name,
-        "icon_name": req.icon_name,
-        "color_hex": req.color_hex
-    }
     try:
-        result = user_lists_col.update_one(
+        result = await user_lists_col.update_one(
             {"_id": ObjectId(list_id), "user_id": user_id},
-            {"$set": update_data}  # <-- USA EL DICCIONARIO COMPLETO
+            {"$set": {
+                "name": req.name,
+                "icon_name": req.icon_name,
+                "color_hex": req.color_hex
+            }}
         )
     except Exception:
         raise HTTPException(status_code=400, detail="ID de lista inválido")
@@ -1298,21 +1343,14 @@ def api_update_list(list_id: str, req: ListUpdateRequest, user_id: str = Depends
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
 
-    updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
-    return UserListBasic(
-        list_id=str(updated_doc["_id"]),
-        name=updated_doc.get("name"),
-        icon_name=updated_doc.get("icon_name", "default"),  # Añade valores por defecto
-        color_hex=updated_doc.get("color_hex", "#FFFFFF"),  # Añade valores por defecto
-        item_count=len(updated_doc.get("items", []))
-    )
-
-
-@app.delete("/lists/{list_id}", status_code=HTTP_204_NO_CONTENT)
-def api_delete_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    # --- REUTILIZAMOS EL HELPER ---
+    return await _get_list_and_map_to_basic(list_id)
+@app.delete("/lists/{list_id}", status_code=204)
+async def api_delete_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
     """Elimina una lista completa."""
     try:
-        result = user_lists_col.delete_one(
+        # Motor: await delete_one
+        result = await user_lists_col.delete_one(
             {"_id": ObjectId(list_id), "user_id": user_id}
         )
     except Exception:
@@ -1321,17 +1359,16 @@ def api_delete_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
     if result.deleted_count == 0:
         raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
 
-    # Si tiene éxito, devuelve un 204 No Content
-    return Response(status_code=HTTP_204_NO_CONTENT)
+    return Response(status_code=204)
 
 
 @app.delete("/lists/{list_id}/items/{item_id}", response_model=UserListBasic)
-def api_remove_item_from_list(list_id: str, item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_remove_item_from_list(list_id: str, item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
     """Elimina un solo item de una lista."""
     try:
-        result = user_lists_col.update_one(
+        result = await user_lists_col.update_one(
             {"_id": ObjectId(list_id), "user_id": user_id},
-            {"$pull": {"items": item_id}}  # $pull elimina el item del array
+            {"$pull": {"items": item_id}}
         )
     except Exception:
         raise HTTPException(status_code=400, detail="ID de lista inválido")
@@ -1339,11 +1376,9 @@ def api_remove_item_from_list(list_id: str, item_id: str, user_id: str = Depends
     if result.matched_count == 0:
         raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
 
-    if result.modified_count == 0:
-        # Esto no es un error, solo significa que el item no estaba en la lista
-        pass
 
-    updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
+    updated_doc = await user_lists_col.find_one({"_id": ObjectId(list_id)})
+
     return UserListBasic(
         list_id=str(updated_doc["_id"]),
         name=updated_doc.get("name"),
@@ -1351,23 +1386,20 @@ def api_remove_item_from_list(list_id: str, item_id: str, user_id: str = Depends
         color_hex=updated_doc.get("color_hex", "#FFFFFF"),
         item_count=len(updated_doc.get("items", []))
     )
+
+
 @app.get("/item/{item_id}", response_model=ItemDetailResponse)
-def api_get_item_details(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    """
-    Endpoint to get detailed information for a specific item_id. Requires authentication.
-    """
-    details = get_item_details(item_id)
+async def api_get_item_details(item_id: str):
+    details = await get_item_details(item_id)
     if details is None:
         raise HTTPException(status_code=404, detail=f"Item with ID '{item_id}' not found")
     return details
 
 
 @app.get("/user/usage", response_model=UserUsageStatus)
-def api_get_user_usage(user_id: str = Depends(get_user_id_from_jwt)):
-    """Devuelve el estado de uso de sesiones diarias del usuario."""
+async def api_get_user_usage(user_id: str = Depends(get_user_id_from_jwt)):
     today_utc_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-
-    sessions_today = sessions_col.count_documents({
+    sessions_today = await sessions_col.count_documents({
         "user_id": user_id,
         "created_date_utc": today_utc_str
     })
@@ -1380,63 +1412,23 @@ def api_get_user_usage(user_id: str = Depends(get_user_id_from_jwt)):
         remaining_today=remaining
     )
 
-# --- Nuevos Endpoints (añadir cerca de los otros endpoints de listas) ---
 
 @app.put("/lists/{list_id}/archive", response_model=UserListBasic)
-def api_archive_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    """Marca una lista como archivada."""
-    try:
-        result = user_lists_col.update_one(
-            {"_id": ObjectId(list_id), "user_id": user_id},
-            {"$set": {"is_archived": True}}
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID de lista inválido")
+async def api_archive_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    # Llamamos al helper con True
+    return await _set_list_archive_status(list_id, user_id, archive=True)
 
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
-
-    updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
-    # Devuelve el estado actualizado completo
-    return UserListBasic(
-        list_id=str(updated_doc["_id"]),
-        name=updated_doc.get("name"),
-        icon_name=updated_doc.get("icon_name", "default"),
-        color_hex=updated_doc.get("color_hex", "#FFFFFF"),
-        item_count=len(updated_doc.get("items", [])),
-        is_archived=updated_doc.get("is_archived", False) # Incluir estado archivado
-    )
 
 @app.put("/lists/{list_id}/unarchive", response_model=UserListBasic)
-def api_unarchive_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    """Desmarca una lista como archivada."""
-    try:
-        result = user_lists_col.update_one(
-            {"_id": ObjectId(list_id), "user_id": user_id},
-            {"$set": {"is_archived": False}}
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID de lista inválido")
+async def api_unarchive_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    # Llamamos al helper con False
+    return await _set_list_archive_status(list_id, user_id, archive=False)
 
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
 
-    updated_doc = user_lists_col.find_one({"_id": ObjectId(list_id)})
-    # Devuelve el estado actualizado completo
-    return UserListBasic(
-        list_id=str(updated_doc["_id"]),
-        name=updated_doc.get("name"),
-        icon_name=updated_doc.get("icon_name", "default"),
-        color_hex=updated_doc.get("color_hex", "#FFFFFF"),
-        item_count=len(updated_doc.get("items", [])),
-        is_archived=updated_doc.get("is_archived", False) # Incluir estado archivado
-    )
-# --- Nuevos Endpoints (añadir cerca de los otros endpoints de listas/final) ---
-
-@app.post("/favorites/{item_id}", status_code=201) # 201 Created
-def api_add_favorite(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    """Añade un item a los favoritos del usuario."""
-    if not items_col.find_one({"itemId": item_id}, {"_id": 1}):
+@app.post("/favorites/{item_id}", status_code=201)
+async def api_add_favorite(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    # Motor: await find_one
+    if not await items_col.find_one({"itemId": item_id}, {"_id": 1}):
         raise HTTPException(404, "Item no encontrado")
 
     now = datetime.now(timezone.utc)
@@ -1446,36 +1438,51 @@ def api_add_favorite(item_id: str, user_id: str = Depends(get_user_id_from_jwt))
         "added_at": now
     }
     try:
-        user_favorites_col.insert_one(favorite_doc)
+        # Motor: await insert_one
+        await user_favorites_col.insert_one(favorite_doc)
         return {"message": "Item añadido a favoritos"}
-    except Exception as e: # Captura error de duplicado (índice único)
-        if "E11000" in str(e):
-             # No es un error si ya existe, es idempotente
+    except Exception as error:
+        if "E11000" in str(error):
             return {"message": "Item ya estaba en favoritos"}
-        logger.error(f"Error añadiendo favorito: {e}")
+        # logger.error(...)
         raise HTTPException(status_code=500, detail="Error interno al añadir favorito")
 
-@app.delete("/favorites/{item_id}", status_code=HTTP_204_NO_CONTENT)
-def api_remove_favorite(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    """Elimina un item de los favoritos del usuario."""
-    result = user_favorites_col.delete_one({"user_id": user_id, "item_id": item_id})
-    if result.deleted_count == 0:
-        # No encontrado, pero la operación es idempotente (el estado deseado es "no favorito")
-        pass
-    return Response(status_code=HTTP_204_NO_CONTENT)
+
+@app.delete("/favorites/{item_id}", status_code=204)
+async def api_remove_favorite(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    await user_favorites_col.delete_one({"user_id": user_id, "item_id": item_id})
+    return Response(status_code=204)
+
 
 @app.get("/favorites", response_model=List[SearchResultItem])
-def api_get_favorites(user_id: str = Depends(get_user_id_from_jwt)):
-    """Obtiene todos los items favoritos de un usuario."""
-    favorites_cursor = user_favorites_col.find({"user_id": user_id}).sort("added_at", -1)
-    favorite_item_ids = [doc["item_id"] for doc in favorites_cursor]
+async def api_get_favorites(user_id: str = Depends(get_user_id_from_jwt)):
+    """Obtiene todos los items favoritos de un usuario (OPTIMIZADO)."""
+
+    # 1. Obtener IDs de favoritos (Motor: to_list)
+    cursor = user_favorites_col.find({"user_id": user_id}).sort("added_at", -1)
+    favorites_docs = await cursor.to_list(length=None)
+
+    if not favorites_docs:
+        return []
+
+    favorite_item_ids = [doc["item_id"] for doc in favorites_docs]
 
     results = []
-    for item_id in favorite_item_ids:
-        # 1. Buscamos el documento directamente en la colección de items
-        doc = items_col.find_one({"itemId": item_id})
 
-        # 2. Si MongoDB lo encuentra (doc no es None), lo procesamos
+    # 2. OPTIMIZACIÓN: Traer todos los items de una vez con $in
+    # Evitamos hacer N queries dentro de un bucle
+    items_cursor = items_col.find({"itemId": {"$in": favorite_item_ids}})
+    items_docs = await items_cursor.to_list(length=None)
+
+    # Mapeo rápido en memoria (esto es rapidísimo en Python)
+    # Convertimos a diccionario para mantener el orden si fuera necesario,
+    # aunque aquí el orden de visualización depende de cómo los proceses.
+    # Si quieres mantener el orden de "agregado recientemente", itera sobre favorite_item_ids
+
+    items_map = {doc["itemId"]: doc for doc in items_docs}
+
+    for item_id in favorite_item_ids:
+        doc = items_map.get(item_id)
         if doc:
             rec_item = row_to_recitem(doc, distance=0.0)
             results.append(SearchResultItem(
@@ -1484,32 +1491,33 @@ def api_get_favorites(user_id: str = Depends(get_user_id_from_jwt)):
                 domain=doc.get("domain", "unknown"),
                 image_url=rec_item.image_url
             ))
+
     return results
 
+
 @app.get("/favorites/status/{item_id}", response_model=FavoriteStatusResponse)
-def api_get_favorite_status(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    """Verifica si un item específico está en los favoritos del usuario."""
-    count = user_favorites_col.count_documents({"user_id": user_id, "item_id": item_id})
+async def api_get_favorite_status(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    # Motor: await count_documents
+    count = await user_favorites_col.count_documents({"user_id": user_id, "item_id": item_id})
     return FavoriteStatusResponse(item_id=item_id, is_favorite=(count > 0))
 
 # Endpoint para randomizar
 @app.post("/session/{session_id}/randomize", response_model=SeedResponse)
-def api_session_randomize(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
-    """Busca un nuevo item aleatorio para la sesión, evitando los ya mostrados."""
-    s = get_session(session_id)
+async def api_session_randomize(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+    # Helper async
+    s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
     if bool(s.get("finished", False)):
-         raise HTTPException(400, "Session already finished")
+        raise HTTPException(400, "Session already finished")
 
-    domain = s["domain"]
     shown_in_session = s.get("shown", [])
     history = s.get("history", [])
+
     exclude_ids = list(shown_in_session)
     if history:
         exclude_ids.append(history[-1][0])
-    last_item_id = s.get("last_item_id")
-    # Pipeline Random
+
     pipeline = [
         {"$match": {
             "domain": s["domain"],
@@ -1518,67 +1526,84 @@ def api_session_randomize(session_id: str, user_id: str = Depends(get_user_id_fr
         {"$sample": {"size": 1}},
         {"$project": {"embedding": 0}}
     ]
-    
-    results = list(items_col.aggregate(pipeline))
+
+    # Motor: aggregate -> to_list
+    cursor = items_col.aggregate(pipeline)
+    results = await cursor.to_list(length=1)
+
     if not results:
-        sessions_col.update_one(
+        # Motor: update_one
+        await sessions_col.update_one(
             {"session_id": session_id},
             {"$set": {"finished": True, "history": history, "shown": shown_in_session}}
         )
-        logger.info(f"No more random items for session {session_id}, finalizing.")
-        return SeedResponse(seed_item=None) # Indica al frontend que terminó
+        return SeedResponse(seed_item=None)
 
-    # 3. Seleccionar uno aleatorio y actualizar la sesión
     new_doc = results[0]
     new_seed = row_to_recitem(new_doc)
-    sessions_col.update_one(
+
+    # Motor: update_one
+    await sessions_col.update_one(
         {"session_id": session_id},
         {"$set": {
             "last_item_id": new_seed.item_id,
-            "history": history, # Guardamos el historial actualizado (con el item anterior como neutro)
-            "shown": shown_in_session # Guardamos los 'shown' actualizados
+            "history": history,
+            "shown": shown_in_session
         }}
     )
 
-    logger.info(f"Randomized seed for session {session_id} to {new_seed.item_id}")
     return SeedResponse(seed_item=new_seed)
 
 
 @app.post("/users/profile")
-def create_or_update_profile(
+async def create_or_update_profile(
         profile_data: UserProfileRequest,
         user_id: str = Depends(get_user_id_from_jwt)
 ):
-    """
-    Guarda o actualiza la edad y nombre del usuario en MongoDB.
-    Se usa el UID de Firebase como la _id del documento.
-    """
     try:
-        # Usamos la colección 'profiles' (o 'users' si prefieres)
-        # upsert=True crea el documento si no existe, o lo actualiza si ya existe.
-        db.users.update_one(
+        # Motor: await update_one
+        await db.users.update_one(
             {"_id": user_id},
             {"$set": {
                 "age": profile_data.age,
                 "name": profile_data.name,
-                "updated_at": datetime.utcnow()  # Opcional: para saber cuándo cambió
+                "updated_at": datetime.now()
             }},
             upsert=True
         )
         return {"status": "success", "message": "Perfil guardado"}
 
-    except Exception as e:
-        print(f"Error DB: {e}")
+    except Exception as error:
+        print(f"Error DB: {error}")
         raise HTTPException(status_code=500, detail="Error interno guardando perfil")
 
 @app.get("/users/get-email/{username}" , response_model = UserLookupResponse)
 async def get_email(username: str):
-    user = db.users.find_one({"name": username})
+    user = await db.users.find_one({"name": username})
     if user:
         return {"email": user["email"]}
     else:
         return {"error usuario no encontrado"}
 
+
+@app.post("/users/create")
+async def create_user(user: UserCreate):  # 1. ASYNC
+
+    # 2. AWAIT en la búsqueda
+    if await db.users.find_one({"name": user.username}):
+        raise HTTPException(400, "Username ya registrado")
+
+    new_user_doc = user.model_dump()
+    if "username" in new_user_doc:
+        new_user_doc["name"] = new_user_doc.pop("username")
+
+    new_user_doc["role"] = "USER"
+    new_user_doc["createdAt"] = datetime.now()
+
+    # 3. AWAIT en la inserción
+    await db.users.insert_one(new_user_doc)
+
+    return {"status": "User created"}
 
 
 @app.get("/health")
