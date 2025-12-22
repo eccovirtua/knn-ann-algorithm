@@ -1611,6 +1611,14 @@ async def create_user(user: UserCreate):
     return {"status": "User created", "id": str(result.inserted_id)}
 
 
+@app.get("/users/check-email/{email}")
+async def check_email_availability(email: str):
+    # Buscamos si existe el email (ignorando mayúsculas/minúsculas)
+    user = await db.users.find_one({"email": {"$regex": f"^{email}$", "$options": "i"}})
+
+    if user:
+        return {"available": False}  # Ya existe
+    return {"available": True}  # Está libre
 @app.get("/health")
 def health():
     return {"status": "ok"}
