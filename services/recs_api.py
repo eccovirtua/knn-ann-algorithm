@@ -1587,23 +1587,28 @@ async def get_email(username: str):
 
 
 @app.post("/users/create")
-async def create_user(user: UserCreate):  # 1. ASYNC
+async def create_user(user: UserCreate):
 
-    # 2. AWAIT en la búsqueda
-    if await db.users.find_one({"name": user.username}):
+    # Verificar que el nombre de usuario no esté registrado
+    existing_user = await db.users.find_one({"name": {"$regex": f"^{user.username}$", "$options": "i"}})
+    if existing_user:
         raise HTTPException(400, "Username ya registrado")
 
-    new_user_doc = user.model_dump()
-    if "username" in new_user_doc:
-        new_user_doc["name"] = new_user_doc.pop("username")
+    # Verificar que el email no esté registrado
+    if await db.users.find_one({"email": user.email}):
+        raise HTTPException(400, "Email ya registrado")
 
-    new_user_doc["role"] = "USER"
-    new_user_doc["createdAt"] = datetime.now()
-
-    # 3. AWAIT en la inserción
-    await db.users.insert_one(new_user_doc)
-
-    return {"status": "User created"}
+    new_user_doc = {
+        "firebaseUid": user.firebaseUid,
+        "email": user.email,
+        "name": user.username,
+        "age": user.age,
+        # "profile_picture": user.profile_picture_url,  # Guardamos la foto
+        "role": "USER",
+        "createdAt": datetime.now(timezone.utc)
+    }
+    result = await db.users.insert_one(new_user_doc)
+    return {"status": "User created", "id": str(result.inserted_id)}
 
 
 @app.get("/health")
