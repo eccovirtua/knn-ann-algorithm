@@ -1619,6 +1619,18 @@ async def check_email_availability(email: str):
     if user:
         return {"available": False}  # Ya existe
     return {"available": True}  # Está libre
+
+
+@app.get("/users/check-username/{username}")
+async def check_username_availability(username: str):
+    # Buscamos en la BD usando regex para ignorar mayúsculas/minúsculas
+    # El "^...$" asegura que sea el match exacto de inicio a fin
+    existing_user = await db.users.find_one({"name": {"$regex": f"^{username}$", "$options": "i"}})
+
+    if existing_user:
+        return {"available": False}  # Ocupado
+    return {"available": True}  # Libre
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
