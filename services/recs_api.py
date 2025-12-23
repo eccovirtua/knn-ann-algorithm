@@ -4,6 +4,7 @@ import re
 from fastapi import Response, Query
 from bson import ObjectId
 import sys
+from firebase_admin import credentials
 import firebase_admin
 from firebase_admin import auth
 import logging
@@ -258,14 +259,35 @@ def _safe_int(value) -> Optional[int]:
     except (ValueError, TypeError):
         return None
 
-# Forma correcta de inicializar Firebase sin tocar variables privadas
+
+# 1. Definimos las posibles rutas donde podría estar el archivo
+# - Opción A: En local (raíz del proyecto)
+# - Opción B: En Cloud Run (montado desde Secret Manager)
+POSSIBLE_PATHS = [
+    "./recommender-ec605-firebase-adminsdk-fbsvc-3249973bce.json", # Local
+    "/secrets/firebase-creds"  # Cloud Run (Ruta absoluta del montaje)
+]
+
+cred_path = None
+
+# Buscamos dónde existe el archivo
+for path in POSSIBLE_PATHS:
+    if os.path.exists(path):
+        cred_path = path
+        break
+
 try:
-    # Intentamos obtener la app por defecto
     firebase_admin.get_app()
 except ValueError:
-    # Si falla (ValueError), significa que no existe, así que la inicializamos
-    firebase_admin.initialize_app()
-
+    if cred_path:
+        # Si encontramos el archivo (Local o Nube), lo usamos
+        cred = credentials.Certificate(cred_path)
+        firebase_admin.initialize_app(cred)
+        print(f"Firebase inicializado usando: {cred_path}")
+    else:
+        # Si no hay archivo, intentamos la identidad por defecto (puede que falle si hay conflicto de proyectos)
+        print("No se encontró JSON de credenciales. Usando Default Credentials.")
+        firebase_admin.initialize_app()
 
 async def _get_list_and_map_to_basic(list_id: str) -> UserListBasic:
     """Helper para buscar una lista por ID y devolver el modelo básico."""
@@ -283,11 +305,11 @@ async def _get_list_and_map_to_basic(list_id: str) -> UserListBasic:
         item_count=len(updated_doc.get("items", []))
     )
 
-async def get_current_user_uid(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+async def get_current_user_uid(auth_creds: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """
     Verifica el ID Token enviado desde Android usando Firebase Auth.
     """
-    token = credentials.credentials
+    token = auth_creds.credentials
     try:
         # Firebase valida la firma, expiración y emisor por ti
         decoded_token = auth.verify_id_token(token)

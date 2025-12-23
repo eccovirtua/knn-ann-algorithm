@@ -210,3 +210,4 @@ __pycache__
 *.pyc
 .git
 data/
+recommender-ec605-firebase-adminsdk-fbsvc-3249973bce.json
