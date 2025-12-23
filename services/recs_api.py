@@ -283,7 +283,7 @@ async def _get_list_and_map_to_basic(list_id: str) -> UserListBasic:
         item_count=len(updated_doc.get("items", []))
     )
 
-async def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
+async def get_current_user_uid(credentials: HTTPAuthorizationCredentials = Depends(security)) -> str:
     """
     Verifica el ID Token enviado desde Android usando Firebase Auth.
     """
@@ -291,14 +291,17 @@ async def get_user_id_from_jwt(credentials: HTTPAuthorizationCredentials = Depen
     try:
         # Firebase valida la firma, expiración y emisor por ti
         decoded_token = auth.verify_id_token(token)
+        uid = decoded_token['uid']
         # El 'uid' es el identificador único y persistente del usuario en Firebase
-        return decoded_token['uid']
+        return uid
+
     except Exception as err:
         logger.error(f"Error de autenticación Firebase: {err}")
         raise HTTPException(
             status_code=401,
             detail="Token de Firebase inválido o expirado"
         )
+
 async def _set_list_archive_status(list_id: str, user_id: str, archive: bool) -> UserListBasic:
     """Helper para cambiar el estado de archivo de una lista."""
     try:
@@ -834,7 +837,7 @@ async def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
     )
 
 @app.get("/stats/dashboard", response_model=UserDashboardStats)
-def api_get_user_dashboard_stats(user_id: str = Depends(get_user_id_from_jwt)):
+def api_get_user_dashboard_stats(user_id: str = Depends(get_current_user_uid)):
     return get_user_dashboard_stats(user_id)
 
 # ---------- Session endpoints (nuevo flujo) ----------
@@ -887,7 +890,7 @@ async def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
 
     return session_id, seed
 @app.get("/user/final-grid/{domain}", response_model=FinalListResponse)
-async def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_current_user_uid)):
     cursor = sessions_col.find(
         {"user_id": user_id, "domain": domain, "finished": True}
     ).sort("created_at", -1).limit(1)
@@ -903,14 +906,14 @@ async def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_user
     return FinalListResponse(recommendations=recs)
 
 @app.post("/session/{domain}/create", response_model=SessionCreateResponse)
-def api_create_session(domain: Domain, user_id: str = Depends(get_user_id_from_jwt)):
+def api_create_session(domain: Domain, user_id: str = Depends()):
     dom = domain.value
     session_id, seed = create_session(user_id, dom)
     return SessionCreateResponse(session_id=session_id, seed=seed)
 
 
 @app.get("/session/{session_id}", response_model=SessionStateResponse)
-async def api_get_session(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_get_session(session_id: str, user_id: str = Depends(get_current_user_uid)):
     # --- CAMBIO MOTOR: Await get_session ---
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
@@ -939,7 +942,7 @@ async def api_get_session(session_id: str, user_id: str = Depends(get_user_id_fr
 
 
 @app.post("/session/{session_id}/feedback", response_model=SeedResponse)
-async def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = Depends(get_current_user_uid)):
     # --- CAMBIO MOTOR: Await get_session ---
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
@@ -1027,7 +1030,7 @@ async def get_session_history(session_id: str) -> List[Tuple[str, int]]:
 
 
 @app.post("/session/{session_id}/reset", response_model=SeedResponseWithSessionId)
-async def api_session_reset(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_session_reset(session_id: str, user_id: str = Depends(get_current_user_uid)):
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
@@ -1126,7 +1129,7 @@ async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
 
 
 @app.get("/session/{session_id}/final-grid", response_model=FinalListResponse)
-async def api_get_final_grid(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_get_final_grid(session_id: str, user_id: str = Depends(get_current_user_uid)):
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
@@ -1149,7 +1152,7 @@ async def api_get_final_grid(session_id: str, user_id: str = Depends(get_user_id
     return FinalListResponse(recommendations=final_items)
 
 @app.post("/session/{session_id}/finalize", response_model=FinalListResponse)
-async def api_session_finalize(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_session_finalize(session_id: str, user_id: str = Depends(get_current_user_uid)):
     # 1. Validar sesión
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
@@ -1192,7 +1195,7 @@ async def api_search_items(query: str, limit: int = 20):
 # ----------------------------------------
 
 @app.post("/lists", response_model=UserListBasic)
-async def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_current_user_uid)):
     now = datetime.now(timezone.utc)
 
     if not req.name or len(req.name) < 1:
@@ -1226,7 +1229,7 @@ async def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_use
 @app.get("/lists", response_model=List[UserListBasic])
 async def api_get_my_lists(
         archived: Optional[bool] = Query(None),
-        user_id: str = Depends(get_user_id_from_jwt)
+        user_id: str = Depends(get_current_user_uid)
 ):
     query: Dict[str, Any] = {"user_id": user_id}
 
@@ -1261,7 +1264,7 @@ async def api_get_my_lists(
 
 
 @app.post("/lists/{list_id}/items", response_model=UserListBasic)
-async def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str = Depends(get_current_user_uid)):
     # 1. Validar item
     if not await items_col.find_one({"itemId": req.item_id}, {"_id": 1}):
         raise HTTPException(404, "Item no encontrado")
@@ -1282,7 +1285,7 @@ async def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str =
     return await _get_list_and_map_to_basic(list_id)
 
 @app.get("/lists/{list_id}", response_model=UserListDetail)
-async def api_get_list_details(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_get_list_details(list_id: str, user_id: str = Depends(get_current_user_uid)):
     try:
         # Motor: await find_one
         list_doc = await user_lists_col.find_one({"_id": ObjectId(list_id), "user_id": user_id})
@@ -1324,7 +1327,7 @@ async def api_get_list_details(list_id: str, user_id: str = Depends(get_user_id_
 
 
 @app.put("/lists/{list_id}", response_model=UserListBasic)
-async def api_update_list(list_id: str, req: ListUpdateRequest, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_update_list(list_id: str, req: ListUpdateRequest, user_id: str = Depends(get_current_user_uid)):
     if not req.name or len(req.name) < 1:
         raise HTTPException(status_code=400, detail="El nombre de la lista no puede estar vacío")
 
@@ -1346,7 +1349,7 @@ async def api_update_list(list_id: str, req: ListUpdateRequest, user_id: str = D
     # --- REUTILIZAMOS EL HELPER ---
     return await _get_list_and_map_to_basic(list_id)
 @app.delete("/lists/{list_id}", status_code=204)
-async def api_delete_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_delete_list(list_id: str, user_id: str = Depends(get_current_user_uid)):
     """Elimina una lista completa."""
     try:
         # Motor: await delete_one
@@ -1363,7 +1366,7 @@ async def api_delete_list(list_id: str, user_id: str = Depends(get_user_id_from_
 
 
 @app.delete("/lists/{list_id}/items/{item_id}", response_model=UserListBasic)
-async def api_remove_item_from_list(list_id: str, item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_remove_item_from_list(list_id: str, item_id: str, user_id: str = Depends(get_current_user_uid)):
     """Elimina un solo item de una lista."""
     try:
         result = await user_lists_col.update_one(
@@ -1397,7 +1400,7 @@ async def api_get_item_details(item_id: str):
 
 
 @app.get("/user/usage", response_model=UserUsageStatus)
-async def api_get_user_usage(user_id: str = Depends(get_user_id_from_jwt)):
+async def api_get_user_usage(user_id: str = Depends(get_current_user_uid)):
     today_utc_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
     sessions_today = await sessions_col.count_documents({
         "user_id": user_id,
@@ -1414,19 +1417,19 @@ async def api_get_user_usage(user_id: str = Depends(get_user_id_from_jwt)):
 
 
 @app.put("/lists/{list_id}/archive", response_model=UserListBasic)
-async def api_archive_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_archive_list(list_id: str, user_id: str = Depends(get_current_user_uid)):
     # Llamamos al helper con True
     return await _set_list_archive_status(list_id, user_id, archive=True)
 
 
 @app.put("/lists/{list_id}/unarchive", response_model=UserListBasic)
-async def api_unarchive_list(list_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_unarchive_list(list_id: str, user_id: str = Depends(get_current_user_uid)):
     # Llamamos al helper con False
     return await _set_list_archive_status(list_id, user_id, archive=False)
 
 
 @app.post("/favorites/{item_id}", status_code=201)
-async def api_add_favorite(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_add_favorite(item_id: str, user_id: str = Depends(get_current_user_uid)):
     # Motor: await find_one
     if not await items_col.find_one({"itemId": item_id}, {"_id": 1}):
         raise HTTPException(404, "Item no encontrado")
@@ -1449,13 +1452,13 @@ async def api_add_favorite(item_id: str, user_id: str = Depends(get_user_id_from
 
 
 @app.delete("/favorites/{item_id}", status_code=204)
-async def api_remove_favorite(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_remove_favorite(item_id: str, user_id: str = Depends(get_current_user_uid)):
     await user_favorites_col.delete_one({"user_id": user_id, "item_id": item_id})
     return Response(status_code=204)
 
 
 @app.get("/favorites", response_model=List[SearchResultItem])
-async def api_get_favorites(user_id: str = Depends(get_user_id_from_jwt)):
+async def api_get_favorites(user_id: str = Depends(get_current_user_uid)):
     """Obtiene todos los items favoritos de un usuario (OPTIMIZADO)."""
 
     # 1. Obtener IDs de favoritos (Motor: to_list)
@@ -1496,14 +1499,14 @@ async def api_get_favorites(user_id: str = Depends(get_user_id_from_jwt)):
 
 
 @app.get("/favorites/status/{item_id}", response_model=FavoriteStatusResponse)
-async def api_get_favorite_status(item_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_get_favorite_status(item_id: str, user_id: str = Depends(get_current_user_uid)):
     # Motor: await count_documents
     count = await user_favorites_col.count_documents({"user_id": user_id, "item_id": item_id})
     return FavoriteStatusResponse(item_id=item_id, is_favorite=(count > 0))
 
 # Endpoint para randomizar
 @app.post("/session/{session_id}/randomize", response_model=SeedResponse)
-async def api_session_randomize(session_id: str, user_id: str = Depends(get_user_id_from_jwt)):
+async def api_session_randomize(session_id: str, user_id: str = Depends(get_current_user_uid)):
     # Helper async
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
@@ -1558,7 +1561,7 @@ async def api_session_randomize(session_id: str, user_id: str = Depends(get_user
 @app.post("/users/profile")
 async def create_or_update_profile(
         profile_data: UserProfileRequest,
-        user_id: str = Depends(get_user_id_from_jwt)
+        user_id: str = Depends(get_current_user_uid)
 ):
     try:
         # Motor: await update_one
@@ -1630,6 +1633,19 @@ async def check_username_availability(username: str):
     if existing_user:
         return {"available": False}  # Ocupado
     return {"available": True}  # Libre
+# Endpoint para el "Semáforo" del Login
+@app.get("/users/me/exists")
+async def check_user_exists(
+    # Asumo que tienes una dependencia para obtener el UID del token
+    # Si no, tendrás que validar el token aquí
+    current_user_uid: str = Depends(get_current_user_uid)
+):
+    user = await db.users.find_one({"firebaseUid": current_user_uid})
+    if user:
+        return {"exists": True}
+    else:
+        return {"exists": False}
+
 
 @app.get("/health")
 def health():
