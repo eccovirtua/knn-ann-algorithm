@@ -906,7 +906,7 @@ async def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_curr
     return FinalListResponse(recommendations=recs)
 
 @app.post("/session/{domain}/create", response_model=SessionCreateResponse)
-def api_create_session(domain: Domain, user_id: str = Depends()):
+def api_create_session(domain: Domain, user_id: str = Depends(get_current_user_uid)):
     dom = domain.value
     session_id, seed = create_session(user_id, dom)
     return SessionCreateResponse(session_id=session_id, seed=seed)
@@ -1586,7 +1586,7 @@ async def get_email(username: str):
     if user:
         return {"email": user["email"]}
     else:
-        return {"error usuario no encontrado"}
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
 
 @app.post("/users/create")
