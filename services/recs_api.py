@@ -231,6 +231,7 @@ class UserCreate(BaseModel):
     email: str
     age: int
     firebaseUid: str
+    profile_picture: Optional[str] = None
 
 
 def _safe_float(value) -> Optional[float]:
@@ -1628,7 +1629,7 @@ async def create_user(user: UserCreate):
         "email": user.email,
         "name": user.username,
         "age": user.age,
-        # "profile_picture": user.profile_picture_url,  # Guardamos la foto
+        "profile_picture": user.profile_picture,
         "role": "USER",
         "createdAt": datetime.now(timezone.utc)
     }
