@@ -234,6 +234,15 @@ class UserCreate(BaseModel):
     profile_picture: Optional[str] = None
 
 
+class UserProfileResponse(BaseModel):
+    firebaseUid: str
+    name: str              # En tu DB es "name", mantengamos la consistencia
+    email: str             # Útil tenerlo
+    age: int
+    profile_picture: Optional[str] = None
+    country: Optional[str] = "International" # Valor por defecto si no existe en DB
+    cover_image: Optional[str] = None
+
 def _safe_float(value) -> Optional[float]:
     """Convierte de forma segura a float, o devuelve None si falla o es NaN."""
     if pd.isna(value): # Esto captura None, np.nan, etc.
@@ -1656,11 +1665,10 @@ async def check_username_availability(username: str):
     if existing_user:
         return {"available": False}  # Ocupado
     return {"available": True}  # Libre
-# Endpoint para el "Semáforo" del Login
+
 @app.get("/users/me/exists")
 async def check_user_exists(
-    # Asumo que tienes una dependencia para obtener el UID del token
-    # Si no, tendrás que validar el token aquí
+
     current_user_uid: str = Depends(get_current_user_uid)
 ):
     user = await db.users.find_one({"firebaseUid": current_user_uid})
@@ -1670,6 +1678,26 @@ async def check_user_exists(
         return {"exists": False}
 
 
+@app.get("/users/{firebase_uid}", response_model=UserProfileResponse)
+async def get_user_profile(firebase_uid: str):
+
+    # Buscamos por el campo "firebaseUid"
+    user = await db.users.find_one({"firebaseUid": firebase_uid})
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    # Mapeamos los datos de Mongo al Modelo Pydantic
+    return UserProfileResponse(
+        firebaseUid=user.get("firebaseUid"),
+        name=user.get("name", "Usuario"),  # Fallback por seguridad
+        email=user.get("email", ""),
+        age=user.get("age", 0),
+        profile_picture=user.get("profile_picture"),
+
+        # Opcionales
+        country=user.get("country", "International"),
+        cover_image=user.get("cover_image")  # Será None si no existe en DB
+    )
 @app.get("/health")
 def health():
     return {"status": "ok"}
