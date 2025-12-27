@@ -242,6 +242,13 @@ class UserProfileResponse(BaseModel):
     profile_picture: Optional[str] = None
     country: Optional[str] = "International" # Valor por defecto si no existe en DB
     cover_image: Optional[str] = None
+    show_age: bool = True
+
+class UserUpdateRequest(BaseModel):
+    country: Optional[str] = None
+    show_age: Optional[bool] = None
+    profile_picture: Optional[str] = None
+    cover_image: Optional[str] = None
 
 def _safe_float(value) -> Optional[float]:
     """Convierte de forma segura a float, o devuelve None si falla o es NaN."""
@@ -1696,8 +1703,30 @@ async def get_user_profile(firebase_uid: str):
 
         # Opcionales
         country=user.get("country", "International"),
-        cover_image=user.get("cover_image")  # Será None si no existe en DB
+        cover_image=user.get("cover_image"),
+        show_age=user.get("show_age", True)
     )
+
+
+@app.put("/users/{firebase_uid}")
+async def update_user(firebase_uid: str, update_data: UserUpdateRequest):
+    # Filtramos los campos que no sean None (para no borrar datos existentes con nulls)
+    update_dict = {k: v for k, v in update_data.model_dump().items() if v is not None}
+
+    if not update_dict:
+        return {"message": "No changes sent"}
+
+    result = await db.users.update_one(
+        {"firebaseUid": firebase_uid},
+        {"$set": update_dict}
+    )
+
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    return {"message": "User updated successfully"}
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
