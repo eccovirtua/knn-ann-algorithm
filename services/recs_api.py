@@ -26,6 +26,10 @@ from services import tmdb_api
 from services.tmdb_api import fetch_movie_poster
 from services.lastfm_api import get_album_art
 from services.lastfm_api import PLACEHOLDER
+from pydantic import BaseModel
+from datetime import datetime, timezone
+
+
 # ---------- logging ----------
 logger = logging.getLogger("recs_api")
 logger.setLevel(logging.INFO)
@@ -1707,7 +1711,30 @@ async def get_user_profile(firebase_uid: str):
         show_age=user.get("show_age", True)
     )
 
+# 1. El nuevo modelo que espera recibir de OutSystems
+class UserSync(BaseModel):
+    outsystems_id: int
+    username: str
 
+# 2. El endpoint que OutSystems llamará
+@app.post("/users/sync")
+async def sync_outsystems_user(user: UserSync):
+    
+    # Verificamos si ya existe por si acaso
+    existing_user = await db.users.find_one({"outsystems_id": user.outsystems_id})
+    if existing_user:
+        return {"status": "User already synchronized"}
+
+    new_user_doc = {
+        "outsystems_id": user.outsystems_id,
+        "username": user.username,
+        "role": "USER",
+        "createdAt": datetime.now(timezone.utc)
+    }
+    
+    result = await db.users.insert_one(new_user_doc)
+    return {"status": "User created in Mongo", "mongo_id": str(result.inserted_id)}
+    
 @app.put("/users/{firebase_uid}")
 async def update_user(firebase_uid: str, update_data: UserUpdateRequest):
     # Filtramos los campos que no sean None (para no borrar datos existentes con nulls)
