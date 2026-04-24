@@ -1,5 +1,6 @@
 # services/recs_api.py
 import os
+from dotenv import load_dotenv
 import re
 from fastapi import Response, Query
 from bson import ObjectId
@@ -39,6 +40,7 @@ logger.addHandler(handler)
 
 # ---------- config & env ----------
 load_dotenv()
+
 JWT_SECRET = os.getenv("JWT_SECRET", "N2wwJveBGKL6f8iWIL7nx+Cl0rMoJUWpyCfsbu+7mHQ=")
 MONGO_URI = os.getenv("MONGODB_URI")
 if not MONGO_URI:
