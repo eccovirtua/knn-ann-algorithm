@@ -2,7 +2,7 @@
 import os
 from dotenv import load_dotenv
 import re
-from fastapi import Response, Query
+from fastapi import Header, Response, Query
 from bson import ObjectId
 import sys
 from firebase_admin import credentials
@@ -40,7 +40,7 @@ logger.addHandler(handler)
 
 # ---------- config & env ----------
 load_dotenv()
-
+API_SECRET_KEY = os.getenv("API_SECRET_KEY", "ClaveSecreta123")
 JWT_SECRET = os.getenv("JWT_SECRET", "N2wwJveBGKL6f8iWIL7nx+Cl0rMoJUWpyCfsbu+7mHQ=")
 MONGO_URI = os.getenv("MONGODB_URI")
 if not MONGO_URI:
@@ -312,6 +312,19 @@ except ValueError:
         print("No se encontró JSON de credenciales. Usando Default Credentials.")
         firebase_admin.initialize_app()
 
+# Tu función validadora
+async def get_outsystems_user(
+    x_api_key: str = Header(...),
+    x_user_id: str = Header(...)
+) -> str:
+    if x_api_key != API_SECRET_KEY:
+        raise HTTPException(status_code=403, detail="Contraseña incorrecta")
+    
+    if not x_user_id:
+        raise HTTPException(status_code=400, detail="Falta el usuario")
+        
+    return x_user_id
+
 async def _get_list_and_map_to_basic(list_id: str) -> UserListBasic:
     """Helper para buscar una lista por ID y devolver el modelo básico."""
     updated_doc = await user_lists_col.find_one({"_id": ObjectId(list_id)})
@@ -399,28 +412,30 @@ BETA_POP = 0.30     # popularidad / base_score
 GAMMA_IMDB = 0.10
 DELTA_NOVELTY = 0.40
 
-def row_to_recitem(doc:dict, distance: float = 0.0) -> RecItem:
+async def row_to_recitem(doc:dict, distance: float = 0.0) -> RecItem:
     item_id = doc.get("item_id") or doc.get("itemId")
     domain = doc.get("domain")
     title = doc.get("title", "")
     image_url = doc.get("image_url") # Leemos la URL del dataset
 
-    if domain == "music" and image_url == PLACEHOLDER:
+    if domain == "music" and image_url == "PLACEHOLDER": # Asumiendo que era un string
         image_url = None
 
     # --- Movies (TMDB) ---
     if domain == "movie" and not image_url:
         title = doc.get("title", "")
         clean_title = title.split("(")[0].strip()
-        try:
-            image_url = asyncio.run(fetch_movie_poster(clean_title))
-        except RuntimeError:
-            loop = asyncio.get_event_loop()
-            image_url = loop.run_until_complete(fetch_movie_poster(clean_title))
+        
+        # ¡AQUÍ ESTÁ LA MAGIA! Borramos el try/except de asyncio
+        # y simplemente le decimos que "espere" (await) el resultado.
+        image_url = await fetch_movie_poster(clean_title)
+
+    # --- Music (Last.fm) ---
     elif domain == "music" and not image_url:
         artist = doc.get("artist", "")
         track = doc.get("title", "")
         item_id = doc.get("item_id") or doc.get("itemId") or ""
+        
         if not artist and item_id.startswith("lf-") and "_" in item_id:
             try:
                 parts = item_id.replace("lf-", "", 1).split("_", 1)
@@ -428,19 +443,24 @@ def row_to_recitem(doc:dict, distance: float = 0.0) -> RecItem:
                 track = parts[1].strip()
             except Exception as err:
                 print(f"⚠️ Error extrayendo artista/track desde item_id: {err}")
+                
         # 🧩 Fallback: intentar dividir el título por guion
         if not artist and "-" in track:
             parts = track.split("-", 1)
             artist = parts[0].strip()
             track = parts[1].strip()
+            
         # 🧩 Consultar imagen del álbum en Last.fm
         if artist and track:
             try:
-                # 📢 La función get_album_art debe retornar la URL real o None.
+                # Nota: Si tu función 'get_album_art' también está definida con 'async def'
+                # en tu código, deberías ponerle un 'await' aquí (await get_album_art(...)).
+                # Si es una función normal (def), déjala tal cual está aquí:
                 image_url = get_album_art(artist, track)
             except Exception as err:
                 print(f"⚠️ Error obteniendo imagen de Last.fm: {err}")
                 image_url = None
+                
     # --- Fallback general ---
     if not image_url:
         image_url = "https://placehold.co/300x450?text=No+Image"
@@ -522,7 +542,7 @@ async def generate_new_seed(domain: str) -> RecItem:
     if not results:
         raise HTTPException(404, "No hay items para el dominio")
 
-    return row_to_recitem(results[0], distance=0.0)
+    return await row_to_recitem(results[0], distance=0.0)
 
 
 async def compute_next_seed(domain: str, user_id: str = None, session_history: List[Tuple[str, int]] = None) -> \
@@ -951,14 +971,14 @@ async def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_curr
     return FinalListResponse(recommendations=recs)
 
 @app.post("/session/{domain}/create", response_model=SessionCreateResponse)
-def api_create_session(domain: Domain, user_id: str = Depends(get_current_user_uid)):
+async def api_create_session(domain: Domain, user_id: str = Depends(get_outsystems_user)):
     dom = domain.value
-    session_id, seed = create_session(user_id, dom)
+    session_id, seed = await create_session(user_id, dom)
     return SessionCreateResponse(session_id=session_id, seed=seed)
 
 
 @app.get("/session/{session_id}", response_model=SessionStateResponse)
-async def api_get_session(session_id: str, user_id: str = Depends(get_current_user_uid)):
+async def api_get_session(session_id: str, user_id: str = Depends(get_outsystems_user)):
     # --- CAMBIO MOTOR: Await get_session ---
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
@@ -970,7 +990,7 @@ async def api_get_session(session_id: str, user_id: str = Depends(get_current_us
         # --- CAMBIO MOTOR: Await find_one ---
         doc = await items_col.find_one({"itemId": last_item_id})
         if doc:
-            last_item = row_to_recitem(doc, distance=0.0)
+            last_item = await row_to_recitem(doc, distance=0.0)
 
     iterations = int(s.get("iterations", len(s.get("shown", [])) or 0))
     limit = int(s.get("limit", SESSION_ITER_LIMIT))
@@ -984,7 +1004,6 @@ async def api_get_session(session_id: str, user_id: str = Depends(get_current_us
         limit=limit,
         finished=finished
     )
-
 
 @app.post("/session/{session_id}/feedback", response_model=SeedResponse)
 async def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = Depends(get_current_user_uid)):
@@ -1759,3 +1778,4 @@ async def update_user(firebase_uid: str, update_data: UserUpdateRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
