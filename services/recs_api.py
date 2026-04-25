@@ -46,7 +46,7 @@ MONGO_URI = os.getenv("MONGODB_URI")
 if not MONGO_URI:
     raise RuntimeError("MONGODB_URI is not defined")
 
-SESSION_DAILY_LIMIT = 3 # Límite diario
+SESSION_DAILY_LIMIT = 9999 # Límite diario
 # ---------- app ----------
 app = FastAPI(title="Recommendation Service")
 app.add_middleware(
