@@ -611,7 +611,7 @@ Optional[RecItem]:
     results = await cursor.to_list(length=1)
 
     if results:
-        return row_to_recitem(results[0], distance=0.0)
+        return await row_to_recitem(results[0], distance=0.0)
 
     return None
 
@@ -1006,7 +1006,7 @@ async def api_get_session(session_id: str, user_id: str = Depends(get_outsystems
     )
 
 @app.post("/session/{session_id}/feedback", response_model=SeedResponse)
-async def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = Depends(get_current_user_uid)):
+async def api_session_feedback(session_id: str, req: FeedbackRequest, user_id: str = Depends(get_outsystems_user)):
     # --- CAMBIO MOTOR: Await get_session ---
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
