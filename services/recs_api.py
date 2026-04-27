@@ -134,7 +134,8 @@ class SeedResponse(BaseModel):
     seed_item: Optional[RecItem] = None  # permitir None cuando la sesión termina
 class SessionCreateResponse(BaseModel):
     session_id: str
-    seed: RecItem
+    seed: Optional[RecItem] = None
+    is_finished: bool = False
 class SessionStateResponse(BaseModel):
     session_id: str
     domain: str
@@ -906,32 +907,58 @@ def api_get_user_dashboard_stats(user_id: str = Depends(get_current_user_uid)):
     return get_user_dashboard_stats(user_id)
 
 # ---------- Session endpoints (nuevo flujo) ----------
-async def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
-    # 1. Obtener fecha UTC actual
+async def create_session(user_id: str, domain: str) -> Tuple[str, Optional[RecItem], bool]:
     now = datetime.now(timezone.utc)
     today_utc_str = now.strftime('%Y-%m-%d')
 
-    # --- CAMBIO MOTOR: Count asíncrono ---
+    # 1. Buscar sesión persistente
+    existing_session = await sessions_col.find_one({
+        "user_id": user_id,
+        "domain": domain,
+        "created_date_utc": today_utc_str,
+        "reset": {"$ne": True}
+    }, sort=[("created_at", -1)])
+
+    if existing_session:
+        is_finished = existing_session.get("finished", False)
+        session_id = existing_session["session_id"]
+        seed = None
+
+        if not is_finished:
+            last_item_id = existing_session.get("last_item_id")
+            if last_item_id:
+                doc = await items_col.find_one({"itemId": last_item_id})
+                if doc:
+                    seed = await row_to_recitem(doc, distance=0.0)
+            
+            # --- RED DE SEGURIDAD ---
+            # Si la sesión no ha terminado pero no pudimos recuperar el ítem,
+            # generamos uno nuevo para no romper la interfaz.
+            if not seed:
+                seed = await generate_new_seed(domain)
+                await sessions_col.update_one(
+                    {"session_id": session_id},
+                    {"$set": {"last_item_id": seed.item_id}}
+                )
+        
+        return session_id, seed, is_finished
+
+    # =========================================================
+    # ¡AQUÍ ESTÁ LA PARTE 2 QUE SE TE HABÍA BORRADO!
+    # Si no hay sesión (Usuario 99), tenemos que crearla:
+    # =========================================================
+    
     daily_count = await sessions_col.count_documents({
         "user_id": user_id,
         "created_date_utc": today_utc_str
     })
-
-    if daily_count >= SESSION_DAILY_LIMIT:
-        # logger.warning(...)
-        raise HTTPException(
-            status_code=429,
-            detail=f"Has alcanzado el límite de {SESSION_DAILY_LIMIT} sesiones por día."
-        )
+    
+    if daily_count >= SESSION_DAILY_LIMIT: # Asegúrate de tener importado SESSION_DAILY_LIMIT
+        raise HTTPException(status_code=429, detail="Límite diario alcanzado")
 
     session_id = str(uuid4())
-
-    # --- CAMBIO MOTOR: Await porque generate_new_seed ahora es async ---
     seed = await generate_new_seed(domain)
 
-    now = datetime.now(timezone.utc)
-
-    # --- CAMBIO MOTOR: Insert asíncrono ---
     await sessions_col.insert_one({
         "session_id": session_id,
         "user_id": user_id,
@@ -942,18 +969,20 @@ async def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
         "iterations": 0,
         "limit": SESSION_ITER_LIMIT,
         "finished": False,
+        "reset": False,
         "history": [(seed.item_id, 0)],
         "shown": [seed.item_id]
     })
-
+    
     await session_feedback_col.insert_one({
         "session_id": session_id,
         "item_id": seed.item_id,
         "feedback": 0,
         "ts": now
     })
+    
+    return session_id, seed, False
 
-    return session_id, seed
 @app.get("/user/final-grid/{domain}", response_model=FinalListResponse)
 async def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_outsystems_user)):
     cursor = sessions_col.find(
@@ -973,8 +1002,12 @@ async def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_outs
 @app.post("/session/{domain}/create", response_model=SessionCreateResponse)
 async def api_create_session(domain: Domain, user_id: str = Depends(get_outsystems_user)):
     dom = domain.value
-    session_id, seed = await create_session(user_id, dom)
-    return SessionCreateResponse(session_id=session_id, seed=seed)
+    session_id, seed, is_finished = await create_session(user_id, dom)
+    return SessionCreateResponse(
+        session_id=session_id, 
+        seed=seed, 
+        is_finished=is_finished
+    )
 
 
 @app.get("/session/{session_id}", response_model=SessionStateResponse)
@@ -1092,23 +1125,27 @@ async def get_session_history(session_id: str) -> List[Tuple[str, int]]:
             continue
     return history
 
-
 @app.post("/session/{session_id}/reset", response_model=SeedResponseWithSessionId)
-async def api_session_reset(session_id: str, user_id: str = Depends(get_current_user_uid)):
+async def api_session_reset(session_id: str, user_id: str = Depends(get_outsystems_user)):
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
 
     new_session_id = str(uuid4())
+    # Marcamos la sesión vieja como terminada y reseteada
     await reset_session(session_id)
+    
+    # Generamos la semilla para la nueva sesión
     seed = await generate_new_seed(s["domain"])
 
+    # Insertamos la nueva sesión limpia
     await sessions_col.insert_one({
         "session_id": new_session_id,
         "user_id": user_id,
         "domain": s["domain"],
         "iterations": 0,
         "finished": False,
+        "reset": False,  # <-- Añadido para mantener coherencia con la nueva lógica
         "history": [(seed.item_id, 0)],
         "shown": [seed.item_id],
         "final_grid": None,
