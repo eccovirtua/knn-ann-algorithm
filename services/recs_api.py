@@ -694,7 +694,7 @@ async def build_final_grid(session_id: str, user_id: str, domain: str,
 
     for doc in final_docs:
         # Convertir a objeto Pydantic
-        rec_item = row_to_recitem(doc)
+        rec_item = await row_to_recitem(doc)
 
         # Calcular Score usando la función auxiliar
         score = _calculate_quality_score(doc, domain)
@@ -955,7 +955,7 @@ async def create_session(user_id: str, domain: str) -> Tuple[str, RecItem]:
 
     return session_id, seed
 @app.get("/user/final-grid/{domain}", response_model=FinalListResponse)
-async def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_current_user_uid)):
+async def get_final_grid_for_domain(domain: str, user_id: str = Depends(get_outsystems_user)):
     cursor = sessions_col.find(
         {"user_id": user_id, "domain": domain, "finished": True}
     ).sort("created_at", -1).limit(1)
@@ -1193,7 +1193,7 @@ async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
 
 
 @app.get("/session/{session_id}/final-grid", response_model=FinalListResponse)
-async def api_get_final_grid(session_id: str, user_id: str = Depends(get_current_user_uid)):
+async def api_get_final_grid(session_id: str, user_id: str = Depends(get_outsystems_user)):
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
         raise HTTPException(404, "Session not found or unauthorized")
@@ -1216,7 +1216,7 @@ async def api_get_final_grid(session_id: str, user_id: str = Depends(get_current
     return FinalListResponse(recommendations=final_items)
 
 @app.post("/session/{session_id}/finalize", response_model=FinalListResponse)
-async def api_session_finalize(session_id: str, user_id: str = Depends(get_current_user_uid)):
+async def api_session_finalize(session_id: str, user_id: str = Depends(get_outsystems_user)):
     # 1. Validar sesión
     s = await get_session(session_id)
     if not s or s["user_id"] != user_id:
@@ -1229,7 +1229,7 @@ async def api_session_finalize(session_id: str, user_id: str = Depends(get_curre
     )
 
     # 3. Obtener grid (Genera recomendaciones y calcula scores internamente)
-    final_response: FinalListResponse = await api_get_final_grid(session_id, user_id)
+    final_response: FinalListResponse = await api_get_final_grid(session_id=session_id, user_id=user_id)
 
     # 4. Obtener el score actualizado
     # Necesitamos consultar de nuevo porque api_get_final_grid actualizó el documento en segundo plano
