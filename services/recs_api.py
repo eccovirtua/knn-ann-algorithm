@@ -1823,12 +1823,12 @@ async def api_get_horror_carousel():
     # IMPORTANTE: Estos títulos deben coincidir EXACTAMENTE con cómo 
     # están escritos en tu base de datos (incluyendo el año si lo tienen).
     target_titles = [
-        "Scream (1996)",
-        "Halloween (1978)",
-        "Exorcist, The (1973)", 
-        "Jurassic Park (1993)",
-        "Nightmare on Elm Street, A (1984)", 
-        "Shining, The (1980)" 
+        "Child's Play 2 (1990)",
+        "Halloween: The Curse of Michael Myers (Halloween 6: The Curse of Michael Myers) (1995)",
+        "Alien (1979)",
+        "Silence of the Lambs, The (1991)",
+        "Texas Chainsaw Massacre, The (2003)",
+        "Grudge, The (2004)"
     ]
 
     # Hacemos una sola consulta rápida buscando cualquiera de esos títulos
