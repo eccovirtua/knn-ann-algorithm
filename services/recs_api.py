@@ -1816,3 +1816,43 @@ async def update_user(firebase_uid: str, update_data: UserUpdateRequest):
 def health():
     return {"status": "ok"}
 
+@app.get("/landing/carousel/horror", response_model=SearchResponse)
+async def api_get_horror_carousel():
+    """Devuelve una lista predefinida de películas para el carrusel de inicio."""
+    
+    # IMPORTANTE: Estos títulos deben coincidir EXACTAMENTE con cómo 
+    # están escritos en tu base de datos (incluyendo el año si lo tienen).
+    target_titles = [
+        "Scream (1996)",
+        "Halloween (1978)",
+        "Exorcist, The (1973)", 
+        "Jurassic Park (1993)",
+        "Nightmare on Elm Street, A (1984)", 
+        "Shining, The (1980)" 
+    ]
+
+    # Hacemos una sola consulta rápida buscando cualquiera de esos títulos
+    cursor = items_col.find(
+        {
+            "title": {"$in": target_titles}, 
+            "domain": "movie"
+        },
+        {"embedding": 0} # No necesitamos el vector aquí, ahorra memoria
+    ).limit(6)
+
+    docs = await cursor.to_list(length=6)
+
+    results = []
+    for doc in docs:
+        # Usamos tu función existente para asegurar que traiga la imagen de TMDB
+        rec_item = await row_to_recitem(doc, distance=0.0) 
+        
+        results.append(SearchResultItem(
+            item_id=rec_item.item_id,
+            title=rec_item.title,
+            domain=doc.get("domain", "movie"),
+            image_url=rec_item.image_url
+        ))
+
+    # Reutilizamos tu modelo SearchResponse para no inventar estructuras nuevas
+    return SearchResponse(results=results)
