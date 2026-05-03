@@ -1203,7 +1203,7 @@ async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
     if not doc:
         return None
 
-    rec_item = row_to_recitem(doc, distance=0.0)
+    rec_item = await row_to_recitem(doc, distance=0.0)
 
     genres_list = None
     genres_data = doc.get("genres")
