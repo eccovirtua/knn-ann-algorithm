@@ -24,7 +24,7 @@ import pandas as pd
 from motor.motor_asyncio import AsyncIOMotorClient
 import asyncio
 from services import tmdb_api
-from services.tmdb_api import fetch_movie_poster
+# from services.tmdb_api import fetch_movie_poster
 from services.lastfm_api import get_album_art
 from services.lastfm_api import PLACEHOLDER
 from pydantic import BaseModel
@@ -546,18 +546,13 @@ async def generate_new_seed(domain: str) -> RecItem:
     return await row_to_recitem(results[0], distance=0.0)
 
 
-async def compute_next_seed(domain: str, user_id: str = None, session_history: List[Tuple[str, int]] = None) -> \
-Optional[RecItem]:
+async def compute_next_seed(domain: str, user_id: str = None, session_history: List[Tuple[str, int]] = None) -> Optional[RecItem]:
     """
-    Calcula el siguiente item semilla.
-    Puede usar un historial pasado explícitamente O buscarlo en BD usando user_id.
+    Calcula el siguiente item semilla aplicando Serendipity Re-ranking.
     """
     history = session_history
-
-    # Si no nos dan historial, pero sí usuario, lo buscamos
     if history is None and user_id:
         history = await get_history(user_id, domain)
-
     if not history:
         history = []
 
@@ -571,18 +566,13 @@ Optional[RecItem]:
             break
 
     query_vector = None
-
-    # 2. Obtener vector del último like (si existe)
     if last_positive_id:
         seed_doc = await items_col.find_one({"itemId": last_positive_id}, {"embedding": 1})
         if seed_doc and "embedding" in seed_doc:
             query_vector = seed_doc["embedding"]
 
-    # 3. Construir Pipeline
     pipeline = []
-
     if query_vector:
-        # A) Búsqueda Vectorial
         pipeline.append({
             "$vectorSearch": {
                 "index": "vector_index",
@@ -593,11 +583,9 @@ Optional[RecItem]:
             }
         })
     else:
-        # B) Random del dominio (Cold start o sin likes recientes)
         pipeline.append({"$match": {"domain": domain}})
         pipeline.append({"$sample": {"size": 10}})
 
-    # 4. Filtrar vistos y dominio
     pipeline.append({
         "$match": {
             "domain": domain,
@@ -606,15 +594,37 @@ Optional[RecItem]:
     })
 
     pipeline.append({"$project": {"embedding": 0}})
-    pipeline.append({"$limit": 1})
+    pipeline.append({"$limit": 10}) # Limitamos a 10 candidatos para reordenar
 
     cursor = items_col.aggregate(pipeline)
-    results = await cursor.to_list(length=1)
+    results = await cursor.to_list(length=10)
 
     if results:
+        # APLICAR SERENDIPITY RE-RANKING
+        positive_ids = [iid for iid, fb in history if fb > 0]
+        user_profile_genres = set()
+        
+        if positive_ids:
+            positive_docs = await items_col.find({"itemId": {"$in": positive_ids}}).to_list(length=None)
+            for d in positive_docs:
+                user_profile_genres.update(_genres_to_set(d.get("genres", [])))
+                
+        for doc in results:
+            base_score = _calculate_quality_score(doc, domain)
+            if base_score <= 0.1:
+                base_score = 1.0 # Empuje a items válidos sin score previo
+                
+            doc_genres = _genres_to_set(doc.get("genres", []))
+            genre_sim = jaccard(doc_genres, user_profile_genres)
+            serendipity_factor = 1.0 - (genre_sim * 0.5) # Ajustamos penalización
+            
+            doc["final_score"] = base_score * serendipity_factor
+
+        results.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
         return await row_to_recitem(results[0], distance=0.0)
 
     return None
+
 
 def _calculate_quality_score(doc: dict, domain: str) -> float:
     """Calcula el score de calidad basado en el dominio."""
@@ -641,16 +651,21 @@ def _calculate_quality_score(doc: dict, domain: str) -> float:
     return round(score, 2)
 
 
-async def build_final_grid(session_id: str, user_id: str, domain: str,
-                           history: List[Tuple[str, int]], target_n: int = 20) -> List[RecItem]:
+async def build_final_grid(session_id: str, user_id: str, domain: str, history: List[Tuple[str, int]], target_n: int = 20) -> List[RecItem]:
+    """Genera la lista final aplicando Serendipia y eliminando duplicados."""
     shown_ids = [iid for iid, _ in history]
-    # Filtramos solo los IDs que tuvieron feedback positivo
     positive_ids = [iid for iid, fb in history if fb > 0]
 
     final_docs = []
+    user_profile_genres = set()
 
     # 1. Recomendaciones Vectoriales (Si hay likes previos)
     if positive_ids:
+        # Extraemos el perfil de géneros de todo lo que le gustó en la sesión
+        positive_docs = await items_col.find({"itemId": {"$in": positive_ids}}).to_list(length=None)
+        for d in positive_docs:
+            user_profile_genres.update(_genres_to_set(d.get("genres", [])))
+            
         last_like = positive_ids[-1]
         seed_doc = await items_col.find_one({"itemId": last_like}, {"embedding": 1})
 
@@ -661,8 +676,8 @@ async def build_final_grid(session_id: str, user_id: str, domain: str,
                         "index": "vector_index",
                         "path": "embedding",
                         "queryVector": seed_doc["embedding"],
-                        "numCandidates": 100,  # Aumentado para tener variedad
-                        "limit": 12  # Intentamos llenar un 60% con recomendaciones inteligentes
+                        "numCandidates": 100,
+                        "limit": 30  # Expandimos límite para dejar que la Serendipia actúe
                     }
                 },
                 {"$match": {"domain": domain, "itemId": {"$nin": shown_ids}}},
@@ -672,47 +687,64 @@ async def build_final_grid(session_id: str, user_id: str, domain: str,
             final_docs.extend(await cursor.to_list(length=None))
 
     # 2. Relleno "Joyas Ocultas" / Random
-    # Calculamos cuántos faltan para llegar a target_n
     current_ids = [d["itemId"] for d in final_docs] + shown_ids
     needed = target_n - len(final_docs)
 
     if needed > 0:
         fill_pipeline = [
             {"$match": {"domain": domain, "itemId": {"$nin": current_ids}}},
-            {"$sample": {"size": needed}},
+            {"$sample": {"size": needed * 2}}, # Traemos el doble de muestra para que haya variedad
             {"$project": {"embedding": 0}}
         ]
         cursor = items_col.aggregate(fill_pipeline)
         final_docs.extend(await cursor.to_list(length=None))
 
-    # 3. Procesar resultados finales
-    # Recortar si nos pasamos y mezclar para que no salgan ordenados por similitud exacta siempre
-    final_docs = final_docs[:target_n]
-    random.shuffle(final_docs)
+    # 3. Re-Ranking con SERENDIPITY
+    for doc in final_docs:
+        base_score = _calculate_quality_score(doc, domain)
+        if base_score <= 0.1:
+            base_score = 1.0 # Empujoncito para joyas ocultas
+
+        doc_genres = _genres_to_set(doc.get("genres", []))
+        genre_sim = jaccard(doc_genres, user_profile_genres)
+        
+        serendipity_factor = 1.0 - (genre_sim * 0.5)
+        final_score = base_score * serendipity_factor
+        
+        doc["final_score"] = final_score
+        doc["serendipity_factor"] = round(serendipity_factor, 2)
+
+    # 4. Ordenar, deduplicar y recortar
+    final_docs.sort(key=lambda x: x.get("final_score", 0.0), reverse=True)
+    
+    seen = set()
+    unique_docs = []
+    for d in final_docs:
+        if d["itemId"] not in seen:
+            seen.add(d["itemId"])
+            unique_docs.append(d)
+            if len(unique_docs) == target_n:
+                break
+                
+    final_docs = unique_docs
 
     final_rec_items = []
     final_items_to_save = []
 
     for doc in final_docs:
-        # Convertir a objeto Pydantic
         rec_item = await row_to_recitem(doc)
-
-        # Calcular Score usando la función auxiliar
-        score = _calculate_quality_score(doc, domain)
-
-        # Preparar datos para guardar
         item_data = rec_item.model_dump()
-        item_data["quality_score"] = score
+        
+        item_data["quality_score"] = round(doc.get("final_score", 0.0), 2)
+        item_data["serendipity_factor"] = doc.get("serendipity_factor", 1.0)
 
         final_rec_items.append(rec_item)
         final_items_to_save.append(item_data)
 
-    # Calcular promedio de la sesión
     avg_quality = 0.0
     if final_items_to_save:
         avg_quality = sum(x["quality_score"] for x in final_items_to_save) / len(final_items_to_save)
 
-    # 4. Guardar en Mongo (Update asíncrono)
     await sessions_col.update_one(
         {"session_id": session_id, "user_id": user_id},
         {"$set": {
@@ -722,6 +754,8 @@ async def build_final_grid(session_id: str, user_id: str, domain: str,
     )
 
     return final_rec_items
+
+
 # Constantes para estimación de tiempo en HORAS
 TIME_ESTIMATES = {
     "movie": 1.75,  # 1 h 45 m en promedio por película
@@ -1855,4 +1889,52 @@ async def api_get_horror_carousel():
         ))
 
     # Reutilizamos tu modelo SearchResponse para no inventar estructuras nuevas
+    return SearchResponse(results=results)
+
+@app.get("/onboarding/movies", response_model=SearchResponse)
+async def api_get_onboarding_movies(
+    filter_by: str = Query("mejores", description="Opciones: mejores, nuevas, genero"),
+    genre: Optional[str] = Query(None, description="Nombre del género si filter_by es 'genero'")
+):
+    """Devuelve 30 películas para la pantalla de Onboarding filtradas dinámicamente"""
+    
+    # 1. Filtro base: que sean películas y que ya tengan la info enriquecida (director existe)
+    match_stage = {"domain": "movie", "director": {"$exists": True}}
+    
+    # Si el usuario eligió "genero" en la UI y envió un género específico
+    if filter_by == "genero" and genre:
+        # Busca el género exacto dentro de la lista de géneros en Mongo (ignorando mayúsculas/minúsculas)
+        match_stage["genres"] = {"$regex": f"^{genre}$", "$options": "i"}
+        
+    pipeline = [{"$match": match_stage}]
+    
+    # 2. Lógica de Ordenamiento (Sorting) según el botón que presionó el usuario
+    if filter_by == "mejores":
+        # Ordenamos por imdb_score de mayor a menor (-1)
+        pipeline.append({"$sort": {"imdb_score": -1}})
+        
+    elif filter_by == "nuevas":
+        pipeline.append({"$sort": {"year_str": -1}}) # Ordena por el año más reciente
+        
+    elif filter_by == "genero":
+        # Para el filtro de género, también mostramos las mejores calificadas de ese género
+        pipeline.append({"$sort": {"imdb_score": -1}})
+        
+    # 3. Limitamos a 30 y quitamos el vector para que sea súper rápido
+    pipeline.append({"$limit": 30})
+    pipeline.append({"$project": {"embedding": 0}})
+    
+    cursor = items_col.aggregate(pipeline)
+    docs = await cursor.to_list(length=30)
+    
+    results = []
+    for doc in docs:
+        rec_item = await row_to_recitem(doc, distance=0.0)
+        results.append(SearchResultItem(
+            item_id=rec_item.item_id,
+            title=rec_item.title,
+            domain="movie",
+            image_url=rec_item.image_url
+        ))
+        
     return SearchResponse(results=results)
