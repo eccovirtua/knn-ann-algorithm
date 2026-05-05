@@ -1210,26 +1210,31 @@ async def search_items(query: str, limit: int = 20) -> List[SearchResultItem]:
     if not query or len(query) < 2:
         return []
 
-    # Motor: find devuelve un cursor
-    cursor = items_col.find(
-        {"title": {"$regex": query, "$options": "i"}},
-        {"embedding": 0}
-    ).limit(limit)
+    # 1. Optimización de Query: 
+    # Usamos proyección para traer solo lo que necesitamos desde la base de datos
+    # Si configuraste un "Text Index" en MongoDB, podrías usar {"$text": {"$search": query}}
+    filter_query = {"title": {"$regex": query, "$options": "i"}}
+    projection = {
+        "itemId": 1, 
+        "title": 1, 
+        "image_url": 1, 
+        "domain": 1, 
+        "_id": 0 # Excluimos el embedding automáticamente al no pedirlo
+    }
 
-    # Motor: to_list para ejecutar la query
+    cursor = items_col.find(filter_query, projection).limit(limit)
     docs = await cursor.to_list(length=limit)
 
-    results = []
-    for doc in docs:
-        rec_item = row_to_recitem(doc)
-        results.append(SearchResultItem(
-            item_id=rec_item.item_id,
-            title=rec_item.title,
-            domain=doc.get("domain", "unknown"),
-            image_url=rec_item.image_url
-        ))
-    return results
-
+    # 2. Mapeo Limpio:
+    # Evitamos llamar a funciones extra si podemos construir el objeto directamente
+    return [
+        SearchResultItem(
+            item_id=str(doc.get("itemId", "unknown")),
+            title=doc.get("title", "Untitled"),
+            domain=doc.get("domain", "movie"),
+            image_url=doc.get("image_url", "")
+        ) for doc in docs
+    ]
 
 async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
     # Motor: await find_one
@@ -1318,13 +1323,21 @@ async def api_session_finalize(session_id: str, user_id: str = Depends(get_outsy
 
 @app.get("/search", response_model=SearchResponse)
 async def api_search_items(query: str, limit: int = 20):
-    if len(query) < 3:
-        raise HTTPException(status_code=400, detail="Query must be at least 3 characters long")
+    # Validamos que no sea solo espacios en blanco
+    clean_query = query.strip()
+    if len(clean_query) < 3:
+        raise HTTPException(
+            status_code=400, 
+            detail="La búsqueda debe tener al menos 3 caracteres"
+        )
 
-    # search_items es async ahora
-    results = await search_items(query, limit)
-    return SearchResponse(results=results)
-
+    try:
+        results = await search_items(clean_query, limit)
+        return SearchResponse(results=results)
+    except Exception as e:
+        # Log del error y respuesta genérica para no exponer el backend
+        print(f"Error en búsqueda: {e}")
+        raise HTTPException(status_code=500, detail="Error interno en el motor de búsqueda")
 # ----------------------------------------
 # ENDPOINTS DE LISTAS DE USUARIO
 # ----------------------------------------
