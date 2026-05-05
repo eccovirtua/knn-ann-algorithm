@@ -1916,7 +1916,7 @@ async def api_get_onboarding_movies(
         pipeline.append({"$sort": {"imdb_score": -1}})
         
     # 3. Limitamos a 30 y quitamos el vector para que sea súper rápido
-    pipeline.append({"$limit": 30)
+    pipeline.append({"$limit": 30})
     pipeline.append({"$project": {"embedding": 0}})
     
     cursor = items_col.aggregate(pipeline)
