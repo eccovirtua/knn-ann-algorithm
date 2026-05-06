@@ -1870,11 +1870,20 @@ async def api_get_horror_carousel():
     # IMPORTANTE: Estos títulos deben coincidir EXACTAMENTE con cómo 
     # están escritos en tu base de datos (incluyendo el año si lo tienen).
     target_titles = [
-        "Sabrina",
-        "Halloween",
-        "Chucky, el muñeco diabólico",
-        "Jurassic Park",
-        "Toy Story 2"
+        "Sueño de fuga",
+        "El Padrino",
+        "Batman: El caballero de la noche",
+        "El Padrino II",
+        "12 Hombres en Pugna",
+        "El señor de los anillos: El retorno del rey",
+        "La Lista de Schindler",
+        "Tiempos Violentos",
+        "El Bueno, El Malo y El Feo",
+        "El señor de los anillos: Las dos torres",
+        "Forrest Gump",
+        "El Club de la Pelea"
+
+
 
     ]
 
