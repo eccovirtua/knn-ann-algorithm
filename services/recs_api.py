@@ -149,6 +149,7 @@ class SearchResultItem(BaseModel):
     title: str
     domain: str # Good to know the type in search results
     image_url: Optional[str] = None
+    imdb_score: str = "N/A"
 
 class SearchResponse(BaseModel):
     results: List[SearchResultItem]
@@ -1889,13 +1890,9 @@ async def api_get_horror_carousel():
 
     # Hacemos una sola consulta rápida buscando cualquiera de esos títulos
     cursor = items_col.find(
-        {
-            "title": {"$in": target_titles}, 
-            "domain": "movie"
-        },
-        {"embedding": 0} # No necesitamos el vector aquí, ahorra memoria
+    {"title": {"$in": target_titles}, "domain": "movie"},
+    {"embedding": 0, "imdb_score": 1} # Incluimos imdb_score explícitamente
     ).limit(12)
-
     docs = await cursor.to_list(length=12)
 
     results = []
@@ -1907,7 +1904,8 @@ async def api_get_horror_carousel():
             item_id=rec_item.item_id,
             title=rec_item.title,
             domain=doc.get("domain", "movie"),
-            image_url=rec_item.image_url
+            image_url=rec_item.image_url,
+            imdb_score=str(doc.get("imdb_score", "N/A"))
         ))
 
     # Reutilizamos tu modelo SearchResponse para no inventar estructuras nuevas
