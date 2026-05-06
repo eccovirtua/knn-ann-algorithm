@@ -1890,8 +1890,11 @@ async def api_get_horror_carousel():
 
     # Hacemos una sola consulta rápida buscando cualquiera de esos títulos
     cursor = items_col.find(
-    {"title": {"$in": target_titles}, "domain": "movie"},
-    {"embedding": 0, "imdb_score": 1} # Incluimos imdb_score explícitamente
+        {
+            "title": {"$in": target_titles}, 
+            "domain": "movie"
+        },
+        {"embedding": 0} # Esto trae TODO lo demás, incluyendo imdb_score
     ).limit(12)
     docs = await cursor.to_list(length=12)
 
