@@ -1871,6 +1871,8 @@ async def api_get_horror_carousel():
     # están escritos en tu base de datos (incluyendo el año si lo tienen).
     target_titles = [
         "Sabrina"
+        "Halloween"
+        "Chucky, el muñeco diabólico"
     ]
 
     # Hacemos una sola consulta rápida buscando cualquiera de esos títulos
