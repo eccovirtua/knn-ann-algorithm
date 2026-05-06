@@ -1894,9 +1894,9 @@ async def api_get_horror_carousel():
             "domain": "movie"
         },
         {"embedding": 0} # No necesitamos el vector aquí, ahorra memoria
-    ).limit(6)
+    ).limit(12)
 
-    docs = await cursor.to_list(length=6)
+    docs = await cursor.to_list(length=12)
 
     results = []
     for doc in docs:
