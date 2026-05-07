@@ -2032,8 +2032,8 @@ async def api_generate_cold_start_recs(req: ColdStartRequest):
                     "index": "vector_index", # Usa el nombre de tu índice vectorial en Mongo
                     "path": "embedding",
                     "queryVector": centroid,
-                    "numCandidates": 50,
-                    "limit": 15
+                    "numCandidates": 150,
+                    "limit": 45
                 }
             },
             {
@@ -2043,7 +2043,7 @@ async def api_generate_cold_start_recs(req: ColdStartRequest):
                 }
             },
             {"$project": {"embedding": 0}},
-            {"$limit": 10} # Devolvemos 10 películas por fila
+            {"$limit": 45} # Devolvemos 10 películas por fila
         ]
 
         cursor = items_col.aggregate(pipeline)
