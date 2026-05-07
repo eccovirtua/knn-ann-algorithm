@@ -1618,53 +1618,6 @@ async def api_remove_favorite(item_id: str, user_id: str = Depends(get_outsystem
     # Retornar un JSON es más fácil de leer para OutSystems que un Response 204 vacío
     return {"status": "success", "message": "Item eliminado de favoritos"}
 
-@app.get("/favorites", response_model=List[SearchResultItem])
-async def api_get_favorites(user_id: str = Depends(get_current_user_uid)):
-    """Obtiene todos los items favoritos de un usuario (OPTIMIZADO)."""
-
-    # 1. Obtener IDs de favoritos (Motor: to_list)
-    cursor = user_favorites_col.find({"user_id": user_id}).sort("added_at", -1)
-    favorites_docs = await cursor.to_list(length=None)
-
-    if not favorites_docs:
-        return []
-
-    favorite_item_ids = [doc["item_id"] for doc in favorites_docs]
-
-    results = []
-
-    # 2. OPTIMIZACIÓN: Traer todos los items de una vez con $in
-    # Evitamos hacer N queries dentro de un bucle
-    items_cursor = items_col.find({"itemId": {"$in": favorite_item_ids}})
-    items_docs = await items_cursor.to_list(length=None)
-
-    # Mapeo rápido en memoria (esto es rapidísimo en Python)
-    # Convertimos a diccionario para mantener el orden si fuera necesario,
-    # aunque aquí el orden de visualización depende de cómo los proceses.
-    # Si quieres mantener el orden de "agregado recientemente", itera sobre favorite_item_ids
-
-    items_map = {doc["itemId"]: doc for doc in items_docs}
-
-    for item_id in favorite_item_ids:
-        doc = items_map.get(item_id)
-        if doc:
-            rec_item = row_to_recitem(doc, distance=0.0)
-            results.append(SearchResultItem(
-                item_id=rec_item.item_id,
-                title=rec_item.title,
-                domain=doc.get("domain", "unknown"),
-                image_url=rec_item.image_url
-            ))
-
-    return results
-
-
-@app.get("/favorites/status/{item_id}", response_model=FavoriteStatusResponse)
-async def api_get_favorite_status(item_id: str, user_id: str = Depends(get_current_user_uid)):
-    # Motor: await count_documents
-    count = await user_favorites_col.count_documents({"user_id": user_id, "item_id": item_id})
-    return FavoriteStatusResponse(item_id=item_id, is_favorite=(count > 0))
-
 # Endpoint para randomizar
 @app.post("/session/{session_id}/randomize", response_model=SeedResponse)
 async def api_session_randomize(session_id: str, user_id: str = Depends(get_current_user_uid)):
