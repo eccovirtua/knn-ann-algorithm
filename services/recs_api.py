@@ -2259,3 +2259,72 @@ async def get_user_watched_list(user_id: str = Depends(get_outsystems_user)):
             ))
             
     return results
+
+@app.get("/search/advanced", response_model=List[SearchResultItem])
+async def advanced_search(
+    q: Optional[str] = Query(None, description="Búsqueda por título"),
+    genre: Optional[str] = Query(None, description="Filtro de género exacto"),
+    keyword: Optional[str] = Query(None, description="Palabra clave"),
+    director: Optional[str] = Query(None, description="Nombre del director"),
+    year: Optional[str] = Query(None, description="Año de lanzamiento"),
+    min_score: Optional[float] = Query(None, description="Puntuación mínima de 0 a 10"),
+    sort_by: Optional[str] = Query("popularity", description="popularity o score")
+):
+    """
+    Buscador avanzado. Combina cualquier cantidad de filtros. 
+    No requiere autenticación.
+    """
+    
+    # 1. El diccionario base. Siempre buscamos películas.
+    query = {"domain": "movie"}
+
+    # 2. Vamos agregando bloques a la consulta solo si el usuario los llenó
+    if q:
+        # Búsqueda insensible a mayúsculas en el título normalizado
+        query["title_norm"] = {"$regex": q.lower(), "$options": "i"}
+        
+    if genre:
+        # Busca el género exacto dentro del array genres_es
+        query["genres_es"] = genre 
+        
+    if keyword:
+        # Busca si la palabra clave está dentro del array keywords_es
+        query["keywords_es"] = {"$regex": keyword.lower(), "$options": "i"}
+        
+    if director:
+        # Búsqueda parcial del director
+        query["director"] = {"$regex": director, "$options": "i"}
+        
+    if year:
+        # Coincidencia exacta del año (es string en tu BD)
+        query["year_str"] = year
+        
+    if min_score:
+        # Mayor o igual ($gte) al score seleccionado
+        query["imdb_score"] = {"$gte": min_score}
+
+    # 3. Determinar el orden (Sorting)
+    # Si eligió 'score', ordenamos por calificación.
+    # Si eligió 'popularity', usamos imdb_votes (que es el mejor indicador de qué tan conocida es)
+    if sort_by == "score":
+        sort_criteria = [("imdb_score", -1)] # -1 significa descendente (de mayor a menor)
+    else:
+        sort_criteria = [("imdb_votes", -1)]
+
+    # 4. Ejecutar la búsqueda en MongoDB
+    # Limitamos a 50 resultados para no colapsar la memoria de OutSystems
+    cursor = items_col.find(query).sort(sort_criteria).limit(50)
+    
+    # 5. Mapear resultados a nuestra estructura estándar
+    results = []
+    async for d in cursor:
+        rec_item = await row_to_recitem(d, distance=0.0)
+        results.append(SearchResultItem(
+            item_id=rec_item.item_id,
+            title=d.get("title_es", rec_item.title), # Priorizamos título en español
+            domain="movie",
+            image_url=rec_item.image_url,
+            imdb_score=str(d.get("imdb_score", "N/A"))
+        ))
+
+    return results
