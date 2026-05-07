@@ -2244,3 +2244,65 @@ async def check_user_onboarded(user_id: str = Depends(get_outsystems_user)):
     count = await user_favorites_col.count_documents({"user_id": user_id}, limit=1)
     
     return {"has_onboarded": count > 0}
+
+@app.get("/favorites", response_model=List[SearchResultItem])
+async def get_user_favorites_list(user_id: str = Depends(get_outsystems_user)):
+    """Devuelve la lista completa de películas favoritas del usuario, de la más nueva a la más antigua."""
+    
+    # 1. Obtener IDs ordenados por fecha de adición (más reciente primero)
+    fav_docs = await user_favorites_col.find({"user_id": user_id}).sort("timestamp", -1).to_list(length=None)
+    fav_ids = [doc["item_id"] for doc in fav_docs]
+    
+    if not fav_ids:
+        return []
+
+    # 2. Traer los detalles de la base de datos principal
+    items_cursor = items_col.find({"itemId": {"$in": fav_ids}})
+    
+    # Convertimos a diccionario para mantener el orden original de fav_ids
+    items_dict = {doc["itemId"]: doc async for doc in items_cursor}
+    
+    # 3. Mapear al modelo de salida
+    results = []
+    for item_id in fav_ids:
+        if item_id in items_dict:
+            d = items_dict[item_id]
+            rec_item = await row_to_recitem(d, distance=0.0)
+            results.append(SearchResultItem(
+                item_id=rec_item.item_id,
+                title=d.get("title", rec_item.title),
+                domain="movie",
+                image_url=rec_item.image_url,
+                imdb_score=str(d.get("imdb_score", "N/A"))
+            ))
+            
+    return results
+
+
+@app.get("/watched", response_model=List[SearchResultItem])
+async def get_user_watched_list(user_id: str = Depends(get_outsystems_user)):
+    """Devuelve la lista completa de películas vistas por el usuario."""
+    
+    watched_docs = await user_watched_col.find({"user_id": user_id}).sort("timestamp", -1).to_list(length=None)
+    watched_ids = [doc["item_id"] for doc in watched_docs]
+    
+    if not watched_ids:
+        return []
+
+    items_cursor = items_col.find({"itemId": {"$in": watched_ids}})
+    items_dict = {doc["itemId"]: doc async for doc in items_cursor}
+    
+    results = []
+    for item_id in watched_ids:
+        if item_id in items_dict:
+            d = items_dict[item_id]
+            rec_item = await row_to_recitem(d, distance=0.0)
+            results.append(SearchResultItem(
+                item_id=rec_item.item_id,
+                title=d.get("title", rec_item.title),
+                domain="movie",
+                image_url=rec_item.image_url,
+                imdb_score=str(d.get("imdb_score", "N/A"))
+            ))
+            
+    return results
