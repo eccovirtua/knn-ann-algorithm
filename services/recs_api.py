@@ -22,7 +22,6 @@ from datetime import datetime, timezone
 import pandas as pd
 from motor.motor_asyncio import AsyncIOMotorClient
 from services import tmdb_api
-# from services.tmdb_api import fetch_movie_poster
 from services.lastfm_api import get_album_art
 from services.lastfm_api import PLACEHOLDER
 from pydantic import BaseModel
@@ -1972,13 +1971,35 @@ async def api_get_onboarding_movies(
     return SearchResponse(results=results)
 
 @app.post("/onboarding/cold-start", response_model=ColdStartResponse)
-async def api_generate_cold_start_recs(req: ColdStartRequest):
+async def api_generate_cold_start_recs(
+    req: ColdStartRequest,
+    user_id: str = Depends(get_outsystems_user)
+    ):
     """
     Recibe las 5 películas elegidas en el onboarding, las agrupa matemáticamente 
     en 3 focos de interés, y devuelve recomendaciones dinámicas para cada foco.
+    Además, guarda estas selecciones iniciales como los primeros Favoritos del usuario.
     """
     if not req.selected_item_ids:
         raise HTTPException(status_code=400, detail="Debe proporcionar items seleccionados.")
+
+    # =======================================================================
+    # NUEVA FASE 1: GUARDAR SELECCIONES COMO FAVORITOS
+    # Usamos upsert=True para crear el registro si no existe, o actualizar 
+    # la fecha si el usuario por alguna razón repite el Onboarding.
+    # =======================================================================
+    for item_id in req.selected_item_ids:
+        await user_favorites_col.update_one(
+            {"user_id": user_id, "item_id": item_id},
+            {"$set": {
+                "user_id": user_id, 
+                "item_id": item_id, 
+                "domain": "movie",
+                "timestamp": datetime.utcnow()
+            }},
+            upsert=True
+        )
+    # =======================================================================
 
     # 1. Traer los documentos de las películas seleccionadas (con sus vectores)
     docs = await items_col.find({
@@ -2043,7 +2064,7 @@ async def api_generate_cold_start_recs(req: ColdStartRequest):
                 }
             },
             {"$project": {"embedding": 0}},
-            {"$limit": 45} # Devolvemos 10 películas por fila
+            {"$limit": 45} # Devolvemos 45 películas por fila
         ]
 
         cursor = items_col.aggregate(pipeline)
