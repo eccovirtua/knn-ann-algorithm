@@ -2047,7 +2047,7 @@ async def api_generate_cold_start_recs(req: ColdStartRequest):
         ]
 
         cursor = items_col.aggregate(pipeline)
-        cluster_docs = await cursor.to_list(length=10)
+        cluster_docs = await cursor.to_list(length=45)
 
         # 6. Mapear resultados
         recommendations = []
