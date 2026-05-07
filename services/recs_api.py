@@ -2236,3 +2236,11 @@ async def api_dynamic_recommendations(user_id: str = Depends(get_outsystems_user
             ))
 
     return ColdStartResponse(clusters=response_clusters)
+
+@app.get("/user/has-onboarded")
+async def check_user_onboarded(user_id: str = Depends(get_outsystems_user)):
+    """Verifica si el usuario ya tiene al menos 1 favorito guardado."""
+    # Usamos limit=1 para que Mongo deje de buscar apenas encuentre el primero (máximo rendimiento)
+    count = await user_favorites_col.count_documents({"user_id": user_id}, limit=1)
+    
+    return {"has_onboarded": count > 0}
