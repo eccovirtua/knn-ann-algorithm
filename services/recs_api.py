@@ -19,16 +19,16 @@ from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timezone
-import random
 import pandas as pd
 from motor.motor_asyncio import AsyncIOMotorClient
-import asyncio
 from services import tmdb_api
 # from services.tmdb_api import fetch_movie_poster
 from services.lastfm_api import get_album_art
 from services.lastfm_api import PLACEHOLDER
 from pydantic import BaseModel
 from datetime import datetime, timezone
+import numpy as np
+from sklearn.cluster import KMeans
 
 
 # ---------- logging ----------
@@ -258,6 +258,16 @@ class UserUpdateRequest(BaseModel):
     profile_picture: Optional[str] = None
     cover_image: Optional[str] = None
 
+class ColdStartRequest(BaseModel):
+    selected_item_ids: List[str]
+
+class ClusterRecommendation(BaseModel):
+    cluster_title: str
+    recommendations: List[SearchResultItem]
+
+class ColdStartResponse(BaseModel):
+    clusters: List[ClusterRecommendation]
+
 def _safe_float(value) -> Optional[float]:
     """Convierte de forma segura a float, o devuelve None si falla o es NaN."""
     if pd.isna(value): # Esto captura None, np.nan, etc.
@@ -430,7 +440,6 @@ async def row_to_recitem(doc:dict, distance: float = 0.0) -> RecItem:
         
         # ¡AQUÍ ESTÁ LA MAGIA! Borramos el try/except de asyncio
         # y simplemente le decimos que "espere" (await) el resultado.
-        image_url = await fetch_movie_poster(clean_title)
 
     # --- Music (Last.fm) ---
     elif domain == "music" and not image_url:
@@ -1961,3 +1970,101 @@ async def api_get_onboarding_movies(
         ))
         
     return SearchResponse(results=results)
+
+@app.post("/onboarding/cold-start", response_model=ColdStartResponse)
+async def api_generate_cold_start_recs(req: ColdStartRequest):
+    """
+    Recibe las 5 películas elegidas en el onboarding, las agrupa matemáticamente 
+    en 3 focos de interés, y devuelve recomendaciones dinámicas para cada foco.
+    """
+    if not req.selected_item_ids:
+        raise HTTPException(status_code=400, detail="Debe proporcionar items seleccionados.")
+
+    # 1. Traer los documentos de las películas seleccionadas (con sus vectores)
+    docs = await items_col.find({
+        "itemId": {"$in": req.selected_item_ids}
+    }).to_list(length=len(req.selected_item_ids))
+
+    if not docs:
+        raise HTTPException(status_code=404, detail="No se encontraron las películas.")
+
+    # Extraer vectores y títulos (priorizamos el título en español si el script ya lo puso)
+    vectors = []
+    titles = []
+    for d in docs:
+        if "embedding" in d:
+            vectors.append(d["embedding"])
+            titles.append(d.get("title", d.get("title", "Desconocida")))
+
+    if len(vectors) == 0:
+        raise HTTPException(status_code=400, detail="Las películas seleccionadas no tienen vectores.")
+
+    # 2. Clustering (Agrupamiento Matemático K-Means)
+    # Si eligió 5 películas, hacemos 3 grupos. Si eligió menos, hacemos menos grupos.
+    num_clusters = min(3, len(vectors))
+    
+    kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(vectors)
+
+    response_clusters = []
+
+    # 3. Procesar cada clúster
+    for i in range(num_clusters):
+        # Películas que cayeron en este grupo
+        cluster_indices = np.where(labels == i)[0]
+        cluster_titles = [titles[idx] for idx in cluster_indices]
+        
+        # El Vector Promedio (Centroide) de este grupo
+        centroid = kmeans.cluster_centers_[i].tolist()
+
+        # 4. Generar el título dinámico de la sección
+        if len(cluster_titles) == 1:
+            row_title = f"Porque te gustó {cluster_titles[0]}"
+        elif len(cluster_titles) == 2:
+            row_title = f"Si te interesan {cluster_titles[0]} y {cluster_titles[1]}"
+        else:
+            row_title = f"Inspirado en {cluster_titles[0]}, {cluster_titles[1]} y más"
+
+        # 5. Búsqueda Vectorial Pura en MongoDB usando el Centroide
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "vector_index", # Usa el nombre de tu índice vectorial en Mongo
+                    "path": "embedding",
+                    "queryVector": centroid,
+                    "numCandidates": 50,
+                    "limit": 15
+                }
+            },
+            {
+                "$match": {
+                    "domain": "movie",
+                    "itemId": {"$nin": req.selected_item_ids} # Excluir las que ya seleccionó
+                }
+            },
+            {"$project": {"embedding": 0}},
+            {"$limit": 10} # Devolvemos 10 películas por fila
+        ]
+
+        cursor = items_col.aggregate(pipeline)
+        cluster_docs = await cursor.to_list(length=10)
+
+        # 6. Mapear resultados
+        recommendations = []
+        for c_doc in cluster_docs:
+            rec_item = await row_to_recitem(c_doc, distance=0.0)
+            recommendations.append(SearchResultItem(
+                item_id=rec_item.item_id,
+                title=c_doc.get("title", rec_item.title),
+                domain="movie",
+                image_url=rec_item.image_url,
+                imdb_score=str(c_doc.get("imdb_score", "N/A"))
+            ))
+
+        if recommendations:
+            response_clusters.append(ClusterRecommendation(
+                cluster_title=row_title,
+                recommendations=recommendations
+            ))
+
+    return ColdStartResponse(clusters=response_clusters)
