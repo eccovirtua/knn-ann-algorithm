@@ -67,6 +67,7 @@ sessions_col = db.get_collection("sessions")
 session_feedback_col = db.get_collection("session_feedback")
 user_lists_col = db.get_collection("user_lists")
 user_favorites_col = db.get_collection("user_favorites")
+user_watched_col = db["user_watched"]
 
 
 # índices defensivos
@@ -1586,33 +1587,36 @@ async def api_unarchive_list(list_id: str, user_id: str = Depends(get_current_us
 
 
 @app.post("/favorites/{item_id}", status_code=201)
-async def api_add_favorite(item_id: str, user_id: str = Depends(get_current_user_uid)):
-    # Motor: await find_one
+async def api_add_favorite(item_id: str, user_id: str = Depends(get_outsystems_user)):
+    """Añade una película a favoritos. Verifica que exista primero."""
+    
+    # 1. Validar que la película realmente exista en nuestra colección principal
     if not await items_col.find_one({"itemId": item_id}, {"_id": 1}):
-        raise HTTPException(404, "Item no encontrado")
+        raise HTTPException(404, "Item no encontrado en la base de datos")
 
-    now = datetime.now(timezone.utc)
-    favorite_doc = {
-        "user_id": user_id,
-        "item_id": item_id,
-        "added_at": now
-    }
-    try:
-        # Motor: await insert_one
-        await user_favorites_col.insert_one(favorite_doc)
-        return {"message": "Item añadido a favoritos"}
-    except Exception as error:
-        if "E11000" in str(error):
-            return {"message": "Item ya estaba en favoritos"}
-        # logger.error(...)
-        raise HTTPException(status_code=500, detail="Error interno al añadir favorito")
+    # 2. Guardar o actualizar usando upsert (evita el error E11000 de duplicidad)
+    await user_favorites_col.update_one(
+        {"user_id": user_id, "item_id": item_id},
+        {"$set": {
+            "user_id": user_id,
+            "item_id": item_id,
+            "domain": "movie",
+            "timestamp": datetime.utcnow()
+        }},
+        upsert=True
+    )
+    
+    return {"status": "success", "message": "Item añadido a favoritos"}
 
 
-@app.delete("/favorites/{item_id}", status_code=204)
-async def api_remove_favorite(item_id: str, user_id: str = Depends(get_current_user_uid)):
+@app.delete("/favorites/{item_id}")
+async def api_remove_favorite(item_id: str, user_id: str = Depends(get_outsystems_user)):
+    """Elimina una película de favoritos."""
+    
     await user_favorites_col.delete_one({"user_id": user_id, "item_id": item_id})
-    return Response(status_code=204)
-
+    
+    # Retornar un JSON es más fácil de leer para OutSystems que un Response 204 vacío
+    return {"status": "success", "message": "Item eliminado de favoritos"}
 
 @app.get("/favorites", response_model=List[SearchResultItem])
 async def api_get_favorites(user_id: str = Depends(get_current_user_uid)):
@@ -2089,3 +2093,42 @@ async def api_generate_cold_start_recs(
             ))
 
     return ColdStartResponse(clusters=response_clusters)
+
+# ==========================================
+# ENDPOINTS PARA "VISTO" (WATCHED)
+# ==========================================
+
+@app.post("/watched/{item_id}")
+async def mark_as_watched(item_id: str, user_id: str = Depends(get_outsystems_user)):
+    """Marca una película como vista por el usuario."""
+    await user_watched_col.update_one(
+        {"user_id": user_id, "item_id": item_id},
+        {"$set": {"user_id": user_id, "item_id": item_id, "domain": "movie", "timestamp": datetime.utcnow()}},
+        upsert=True
+    )
+    return {"status": "success", "message": "Marcada como vista"}
+
+@app.delete("/watched/{item_id}")
+async def unmark_as_watched(item_id: str, user_id: str = Depends(get_outsystems_user)):
+    """Desmarca una película como vista."""
+    await user_watched_col.delete_one({"user_id": user_id, "item_id": item_id})
+    return {"status": "success", "message": "Desmarcada como vista"}
+
+
+# ==========================================
+# ENDPOINT DE ESTADO (Para la Pantalla de Detalle)
+# ==========================================
+
+@app.get("/item-status/{item_id}")
+async def get_item_status(item_id: str, user_id: str = Depends(get_outsystems_user)):
+    """
+    Devuelve True o False indicando si el usuario tiene esta película 
+    en sus favoritos y/o en sus vistas. Ideal para inicializar los botones.
+    """
+    fav = await user_favorites_col.find_one({"user_id": user_id, "item_id": item_id})
+    watched = await user_watched_col.find_one({"user_id": user_id, "item_id": item_id})
+    
+    return {
+        "is_favorite": fav is not None,
+        "is_watched": watched is not None
+    }
