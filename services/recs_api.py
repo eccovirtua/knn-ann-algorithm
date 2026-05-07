@@ -2132,3 +2132,107 @@ async def get_item_status(item_id: str, user_id: str = Depends(get_outsystems_us
         "is_favorite": fav is not None,
         "is_watched": watched is not None
     }
+
+@app.get("/recommendations/dynamic", response_model=ColdStartResponse)
+async def api_dynamic_recommendations(user_id: str = Depends(get_outsystems_user)):
+    """
+    Lee TODOS los favoritos del usuario, genera clústeres basados en su 
+    historial completo y excluye de las recomendaciones las películas 
+    que ya vio o que ya tiene en favoritos.
+    """
+    
+    # 1. Obtener el historial completo de Favoritos
+    fav_cursor = user_favorites_col.find({"user_id": user_id})
+    fav_item_ids = [doc["item_id"] async for doc in fav_cursor]
+
+    if not fav_item_ids:
+        # Si por alguna razón no tiene favoritos, podríamos devolver una lista vacía 
+        # o lanzar un error para que OutSystems lo mande al Onboarding
+        raise HTTPException(status_code=404, detail="El usuario no tiene favoritos para generar recomendaciones.")
+
+    # 2. Obtener el historial de Vistas (Watched)
+    watched_cursor = user_watched_col.find({"user_id": user_id})
+    watched_item_ids = [doc["item_id"] async for doc in watched_cursor]
+
+    # Lista maestra de exclusión (No recomendar lo que ya le gusta o ya vio)
+    items_to_exclude = list(set(fav_item_ids + watched_item_ids))
+
+    # 3. Traer los vectores solo de sus favoritos
+    docs = await items_col.find({
+        "itemId": {"$in": fav_item_ids}
+    }).to_list(length=None)
+
+    vectors = []
+    titles = []
+    for d in docs:
+        if "embedding" in d:
+            vectors.append(d["embedding"])
+            titles.append(d.get("title", "Desconocida"))
+
+    if len(vectors) == 0:
+        raise HTTPException(status_code=400, detail="Los favoritos no tienen vectores.")
+
+    # 4. Clustering (K-Means)
+    num_clusters = min(3, len(vectors))
+    
+    kmeans = KMeans(n_clusters=num_clusters, random_state=42, n_init=10)
+    labels = kmeans.fit_predict(vectors)
+
+    response_clusters = []
+
+    # 5. Procesar cada clúster
+    for i in range(num_clusters):
+        cluster_indices = np.where(labels == i)[0]
+        cluster_titles = [titles[idx] for idx in cluster_indices]
+        centroid = kmeans.cluster_centers_[i].tolist()
+
+        # Generar título basado en sus gustos
+        if len(cluster_titles) == 1:
+            row_title = f"Porque te encanta {cluster_titles[0]}"
+        elif len(cluster_titles) == 2:
+            row_title = f"Si sigues pensando en {cluster_titles[0]} y {cluster_titles[1]}"
+        else:
+            row_title = f"Inspirado en tu gusto por {cluster_titles[0]}, {cluster_titles[1]} y más"
+
+        # Búsqueda Vectorial con la lista maestra de exclusión
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "vector_index", 
+                    "path": "embedding",
+                    "queryVector": centroid,
+                    "numCandidates": 150,
+                    "limit": 45
+                }
+            },
+            {
+                "$match": {
+                    "domain": "movie",
+                    "itemId": {"$nin": items_to_exclude} # <--- LA MAGIA ESTÁ AQUÍ
+                }
+            },
+            {"$project": {"embedding": 0}},
+            {"$limit": 45} 
+        ]
+
+        cursor = items_col.aggregate(pipeline)
+        cluster_docs = await cursor.to_list(length=45)
+
+        recommendations = []
+        for c_doc in cluster_docs:
+            rec_item = await row_to_recitem(c_doc, distance=0.0)
+            recommendations.append(SearchResultItem(
+                item_id=rec_item.item_id,
+                title=c_doc.get("title", rec_item.title),
+                domain="movie",
+                image_url=rec_item.image_url,
+                imdb_score=str(c_doc.get("imdb_score", "N/A"))
+            ))
+
+        if recommendations:
+            response_clusters.append(ClusterRecommendation(
+                cluster_title=row_title,
+                recommendations=recommendations
+            ))
+
+    return ColdStartResponse(clusters=response_clusters)
