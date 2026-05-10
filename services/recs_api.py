@@ -164,7 +164,7 @@ class ItemDetailResponse(RecItem): # Inherit from RecItem to include basic field
     domain_type: Optional[str] = None
     overview: Optional[str] = None
     genres_es_text: Optional[str] = None
-    keywords_es: Optional[List[str]] = None
+    keywords_es_text: Optional[str] = None
 class FinalListResponse(BaseModel):
     recommendations: List[RecItem]
     session_avg_quality: float = 0.0
@@ -1187,6 +1187,9 @@ async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
     # La convertimos a un solo texto separado por comas (Ej: "Acción, Comedia, Drama")
     texto_generos_es = ", ".join(lista_generos_es) if lista_generos_es else None
 
+    lista_keywords = _parse_list_or_string(doc.get("keywords_es"))
+    texto_keywords = ", ".join(lista_keywords) if lista_keywords else None
+
     return ItemDetailResponse(
         item_id=rec_item.item_id,
         title=rec_item.title,
@@ -1204,7 +1207,7 @@ async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
         domain_type=doc.get("domain_type"),
         overview=doc.get("overview"),
         genres_es_text=texto_generos_es,
-        keywords_es=_parse_list_or_string(doc.get("keywords_es"))
+        keywords_es_text=texto_keywords, 
     )
 
 
