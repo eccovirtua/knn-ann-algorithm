@@ -166,6 +166,11 @@ class ItemDetailResponse(RecItem): # Inherit from RecItem to include basic field
     google_avg_rating: Optional[int] = None
     imdb_score: Optional[float] = None
     listeners: Optional[int] = None
+    director: Optional[str] = None
+    domain_type: Optional[str] = None
+    overview: Optional[str] = None
+    genres_es: Optional[List[str]] = None
+    keywords_es: Optional[List[str]] = None
 class FinalListResponse(BaseModel):
     recommendations: List[RecItem]
     session_avg_quality: float = 0.0
@@ -1246,6 +1251,13 @@ async def search_items(query: str, limit: int = 20) -> List[SearchResultItem]:
         ) for doc in docs
     ]
 
+def _parse_list_or_string(data) -> Optional[List[str]]:
+    if isinstance(data, str):
+        return [d.strip() for d in data.split('|') if d.strip()]
+    elif isinstance(data, list):
+        return [str(d).strip() for d in data if str(d).strip()]
+    return None
+
 async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
     # Motor: await find_one
     doc = await items_col.find_one({"itemId": item_id})
@@ -1254,13 +1266,7 @@ async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
 
     rec_item = await row_to_recitem(doc, distance=0.0)
 
-    genres_list = None
-    genres_data = doc.get("genres")
-    if isinstance(genres_data, str):
-        genres_list = [g.strip() for g in genres_data.split('|') if g.strip()]
-    elif isinstance(genres_data, list):
-        genres_list = [str(g).strip() for g in genres_data if str(g).strip()]
-
+    # Extraer el año
     year_match = re.search(r"\((\d{4})\)", doc.get('title', ''))
     year = year_match.group(1) if year_match else doc.get("year_str")
 
@@ -1269,12 +1275,19 @@ async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
         title=rec_item.title,
         distance=rec_item.distance,
         image_url=rec_item.image_url,
-        genres=genres_list,
+        genres=_parse_list_or_string(doc.get("genres")),
         year=year,
         artist=doc.get("artist"),
         google_avg_rating=_safe_int(doc.get("google_avg_rating")),
         imdb_score=_safe_float(doc.get("imdb_score")),
-        listeners=_safe_int(doc.get("listeners"))
+        listeners=_safe_int(doc.get("listeners")),
+        
+        # === NUEVOS CAMPOS MAPEADOS ===
+        director=doc.get("director"),
+        domain_type=doc.get("domain_type"),
+        overview=doc.get("overview"),
+        genres_es=_parse_list_or_string(doc.get("genres_es")),
+        keywords_es=_parse_list_or_string(doc.get("keywords_es"))
     )
 
 
@@ -2328,3 +2341,58 @@ async def advanced_search(
         ))
 
     return results
+
+@app.get("/items/{item_id}/similar", response_model=List[ItemDetailResponse])
+async def get_similar_items(item_id: str, limit: int = 10):
+    # 1. Obtenemos el documento base para saber de qué trata
+    base_doc = await items_col.find_one({"itemId": item_id})
+    if not base_doc:
+        return [] # O devolver un error 404
+
+    # 2. Extraemos los géneros para usarlos como filtro de búsqueda
+    base_genres = _parse_list_or_string(base_doc.get("genres")) or []
+    
+    # 3. Construimos la consulta de MongoDB
+    query = {
+        "itemId": {"$ne": item_id} # $ne = Not Equal (Excluir la película actual)
+    }
+    
+    # Si la película base tiene géneros, buscamos películas que compartan alguno ($in)
+    if base_genres:
+        query["genres"] = {"$in": [re.compile(g, re.IGNORECASE) for g in base_genres]}
+        
+    # Si quieres limitar a que solo recomiende del mismo tipo (ej. película con película, no película con serie)
+    domain_type = base_doc.get("domain_type")
+    if domain_type:
+        query["domain_type"] = domain_type
+
+    # 4. Ejecutamos la búsqueda, ordenando por puntuación IMDB de mayor a menor
+    cursor = items_col.find(query).sort("imdb_score", -1).limit(limit)
+    
+    similar_items = []
+    async for doc in cursor:
+        rec_item = await row_to_recitem(doc, distance=0.0)
+        
+        year_match = re.search(r"\((\d{4})\)", doc.get('title', ''))
+        year = year_match.group(1) if year_match else doc.get("year_str")
+
+        # Reutilizamos el modelo de respuesta
+        similar_items.append(ItemDetailResponse(
+            item_id=rec_item.item_id,
+            title=rec_item.title,
+            distance=rec_item.distance,
+            image_url=rec_item.image_url,
+            genres=_parse_list_or_string(doc.get("genres")),
+            year=year,
+            artist=doc.get("artist"),
+            google_avg_rating=_safe_int(doc.get("google_avg_rating")),
+            imdb_score=_safe_float(doc.get("imdb_score")),
+            listeners=_safe_int(doc.get("listeners")),
+            director=doc.get("director"),
+            domain_type=doc.get("domain_type"),
+            overview=doc.get("overview"),
+            genres_es=_parse_list_or_string(doc.get("genres_es")),
+            keywords_es=_parse_list_or_string(doc.get("keywords_es"))
+        ))
+
+    return similar_items
