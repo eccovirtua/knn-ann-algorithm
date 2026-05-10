@@ -2,28 +2,23 @@
 import os
 from dotenv import load_dotenv
 import re
-from fastapi import Header, Response, Query
+from fastapi import Header, Query
 from bson import ObjectId
 import sys
-from firebase_admin import credentials
-import firebase_admin
-from firebase_admin import auth
 import logging
 from enum import Enum
 from uuid import uuid4
-from typing import List, Tuple, Optional, Dict, Any
+from typing import List, Tuple, Optional, Dict
 from dotenv import load_dotenv
 import math
 from fastapi import FastAPI, HTTPException, Depends
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import HTTPBearer
 from starlette.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from datetime import datetime, timezone
 import pandas as pd
 from motor.motor_asyncio import AsyncIOMotorClient
 from services import tmdb_api
-from services.lastfm_api import get_album_art
-from services.lastfm_api import PLACEHOLDER
 from pydantic import BaseModel
 from datetime import datetime, timezone
 import numpy as np
@@ -40,7 +35,6 @@ logger.addHandler(handler)
 # ---------- config & env ----------
 load_dotenv()
 API_SECRET_KEY = os.getenv("API_SECRET_KEY", "ClaveSecreta123")
-JWT_SECRET = os.getenv("JWT_SECRET", "N2wwJveBGKL6f8iWIL7nx+Cl0rMoJUWpyCfsbu+7mHQ=")
 MONGO_URI = os.getenv("MONGODB_URI")
 if not MONGO_URI:
     raise RuntimeError("MONGODB_URI is not defined")
@@ -316,18 +310,6 @@ for path in POSSIBLE_PATHS:
         cred_path = path
         break
 
-try:
-    firebase_admin.get_app()
-except ValueError:
-    if cred_path:
-        # Si encontramos el archivo (Local o Nube), lo usamos
-        cred = credentials.Certificate(cred_path)
-        firebase_admin.initialize_app(cred)
-        print(f"Firebase inicializado usando: {cred_path}")
-    else:
-        # Si no hay archivo, intentamos la identidad por defecto (puede que falle si hay conflicto de proyectos)
-        print("No se encontró JSON de credenciales. Usando Default Credentials.")
-        firebase_admin.initialize_app()
 
 # Tu función validadora
 async def get_outsystems_user(
@@ -357,25 +339,6 @@ async def _get_list_and_map_to_basic(list_id: str) -> UserListBasic:
         color_hex=updated_doc.get("color_hex", "#FFFFFF"),
         item_count=len(updated_doc.get("items", []))
     )
-
-async def get_current_user_uid(auth_creds: HTTPAuthorizationCredentials = Depends(security)) -> str:
-    """
-    Verifica el ID Token enviado desde Android usando Firebase Auth.
-    """
-    token = auth_creds.credentials
-    try:
-        # Firebase valida la firma, expiración y emisor por ti
-        decoded_token = auth.verify_id_token(token)
-        uid = decoded_token['uid']
-        # El 'uid' es el identificador único y persistente del usuario en Firebase
-        return uid
-
-    except Exception as err:
-        logger.error(f"Error de autenticación Firebase: {err}")
-        raise HTTPException(
-            status_code=401,
-            detail="Token de Firebase inválido o expirado"
-        )
 
 async def _set_list_archive_status(list_id: str, user_id: str, archive: bool) -> UserListBasic:
     """Helper para cambiar el estado de archivo de una lista."""
@@ -445,38 +408,6 @@ async def row_to_recitem(doc:dict, distance: float = 0.0) -> RecItem:
         
         # ¡AQUÍ ESTÁ LA MAGIA! Borramos el try/except de asyncio
         # y simplemente le decimos que "espere" (await) el resultado.
-
-    # --- Music (Last.fm) ---
-    elif domain == "music" and not image_url:
-        artist = doc.get("artist", "")
-        track = doc.get("title", "")
-        item_id = doc.get("item_id") or doc.get("itemId") or ""
-        
-        if not artist and item_id.startswith("lf-") and "_" in item_id:
-            try:
-                parts = item_id.replace("lf-", "", 1).split("_", 1)
-                artist = parts[0].strip()
-                track = parts[1].strip()
-            except Exception as err:
-                print(f"⚠️ Error extrayendo artista/track desde item_id: {err}")
-                
-        # 🧩 Fallback: intentar dividir el título por guion
-        if not artist and "-" in track:
-            parts = track.split("-", 1)
-            artist = parts[0].strip()
-            track = parts[1].strip()
-            
-        # 🧩 Consultar imagen del álbum en Last.fm
-        if artist and track:
-            try:
-                # Nota: Si tu función 'get_album_art' también está definida con 'async def'
-                # en tu código, deberías ponerle un 'await' aquí (await get_album_art(...)).
-                # Si es una función normal (def), déjala tal cual está aquí:
-                image_url = get_album_art(artist, track)
-            except Exception as err:
-                print(f"⚠️ Error obteniendo imagen de Last.fm: {err}")
-                image_url = None
-                
     # --- Fallback general ---
     if not image_url:
         image_url = "https://placehold.co/300x450?text=No+Image"
@@ -951,10 +882,6 @@ async def get_user_dashboard_stats(user_id: str) -> UserDashboardStats:
         domain_stats=domain_stats_map
     )
 
-@app.get("/stats/dashboard", response_model=UserDashboardStats)
-def api_get_user_dashboard_stats(user_id: str = Depends(get_current_user_uid)):
-    return get_user_dashboard_stats(user_id)
-
 # ---------- Session endpoints (nuevo flujo) ----------
 async def create_session(user_id: str, domain: str) -> Tuple[str, Optional[RecItem], bool]:
     now = datetime.now(timezone.utc)
@@ -1361,205 +1288,7 @@ async def api_search_items(query: str, limit: int = 20):
         # Log del error y respuesta genérica para no exponer el backend
         print(f"Error en búsqueda: {e}")
         raise HTTPException(status_code=500, detail="Error interno en el motor de búsqueda")
-# ----------------------------------------
-# ENDPOINTS DE LISTAS DE USUARIO
-# ----------------------------------------
 
-@app.post("/lists", response_model=UserListBasic)
-async def api_create_list(req: ListCreateRequest, user_id: str = Depends(get_current_user_uid)):
-    now = datetime.now(timezone.utc)
-
-    if not req.name or len(req.name) < 1:
-        raise HTTPException(status_code=400, detail="El nombre de la lista no puede estar vacío")
-
-    new_list = {
-        "user_id": user_id,
-        "name": req.name,
-        "icon_name": req.icon_name,
-        "color_hex": req.color_hex,
-        "created_at": now,
-        "items": []
-    }
-    try:
-        # Motor: await insert_one
-        result = await user_lists_col.insert_one(new_list)
-        return UserListBasic(
-            list_id=str(result.inserted_id),
-            name=req.name,
-            item_count=0,
-            icon_name=req.icon_name,
-            color_hex=req.color_hex
-        )
-    except Exception as err:
-        logger.error(f"Error al crear lista: {err}")
-        if "E11000" in str(err):
-            raise HTTPException(status_code=400, detail="Ya existe una lista con ese nombre")
-        raise HTTPException(status_code=500, detail="Error interno al crear la lista")
-
-
-@app.get("/lists", response_model=List[UserListBasic])
-async def api_get_my_lists(
-        archived: Optional[bool] = Query(None),
-        user_id: str = Depends(get_current_user_uid)
-):
-    query: Dict[str, Any] = {"user_id": user_id}
-
-    if archived:
-        query["is_archived"] = True
-    elif archived is False:
-        query["$or"] = [
-            {"is_archived": False},
-            {"is_archived": {"$exists": False}}
-        ]
-    else:
-        query["$or"] = [
-            {"is_archived": False},
-            {"is_archived": {"$exists": False}}
-        ]
-
-
-    cursor = user_lists_col.find(query).sort("created_at", -1)
-
-    results = []
-
-    async for list_doc in cursor:
-        results.append(UserListBasic(
-            list_id=str(list_doc["_id"]),
-            name=list_doc.get("name", "Lista sin nombre"),
-            icon_name=list_doc.get("icon_name", "default"),
-            color_hex=list_doc.get("color_hex", "#FFFFFF"),
-            item_count=len(list_doc.get("items", [])),
-            is_archived=list_doc.get("is_archived", False)
-        ))
-    return results
-
-
-@app.post("/lists/{list_id}/items", response_model=UserListBasic)
-async def api_add_item_to_list(list_id: str, req: ItemAddRequest, user_id: str = Depends(get_current_user_uid)):
-    # 1. Validar item
-    if not await items_col.find_one({"itemId": req.item_id}, {"_id": 1}):
-        raise HTTPException(404, "Item no encontrado")
-
-    # 2. Update
-    try:
-        result = await user_lists_col.update_one(
-            {"_id": ObjectId(list_id), "user_id": user_id},
-            {"$addToSet": {"items": req.item_id}}
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID de lista inválido")
-
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
-
-    # --- REUTILIZAMOS EL HELPER ---
-    return await _get_list_and_map_to_basic(list_id)
-
-@app.get("/lists/{list_id}", response_model=UserListDetail)
-async def api_get_list_details(list_id: str, user_id: str = Depends(get_current_user_uid)):
-    try:
-        # Motor: await find_one
-        list_doc = await user_lists_col.find_one({"_id": ObjectId(list_id), "user_id": user_id})
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID de lista inválido")
-
-    if not list_doc:
-        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
-
-    item_ids = list_doc.get("items", [])
-    item_details_list = []
-
-    # --- OPTIMIZACIÓN IMPORTANTE ---
-    # En lugar de hacer un bucle for con find_one (N+1 queries),
-    # usamos el operador $in para traerlos todos de una vez.
-    if item_ids:
-        cursor = items_col.find({"itemId": {"$in": item_ids}})
-        # Traemos todos los items de golpe
-        items_docs = await cursor.to_list(length=None)
-
-        # Mapeamos los resultados
-        for doc in items_docs:
-            rec_item = row_to_recitem(doc, distance=0.0)
-            item_details_list.append(SearchResultItem(
-                item_id=rec_item.item_id,
-                title=rec_item.title,
-                domain=doc.get("domain", "unknown"),
-                image_url=rec_item.image_url
-            ))
-
-    return UserListDetail(
-        list_id=str(list_doc["_id"]),
-        name=list_doc.get("name"),
-        item_count=len(item_details_list),
-        icon_name=list_doc.get("icon_name", "default"),
-        color_hex=list_doc.get("color_hex", "#FFFFFF"),
-        items=item_details_list
-    )
-
-
-@app.put("/lists/{list_id}", response_model=UserListBasic)
-async def api_update_list(list_id: str, req: ListUpdateRequest, user_id: str = Depends(get_current_user_uid)):
-    if not req.name or len(req.name) < 1:
-        raise HTTPException(status_code=400, detail="El nombre de la lista no puede estar vacío")
-
-    try:
-        result = await user_lists_col.update_one(
-            {"_id": ObjectId(list_id), "user_id": user_id},
-            {"$set": {
-                "name": req.name,
-                "icon_name": req.icon_name,
-                "color_hex": req.color_hex
-            }}
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID de lista inválido")
-
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
-
-    # --- REUTILIZAMOS EL HELPER ---
-    return await _get_list_and_map_to_basic(list_id)
-@app.delete("/lists/{list_id}", status_code=204)
-async def api_delete_list(list_id: str, user_id: str = Depends(get_current_user_uid)):
-    """Elimina una lista completa."""
-    try:
-        # Motor: await delete_one
-        result = await user_lists_col.delete_one(
-            {"_id": ObjectId(list_id), "user_id": user_id}
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID de lista inválido")
-
-    if result.deleted_count == 0:
-        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
-
-    return Response(status_code=204)
-
-
-@app.delete("/lists/{list_id}/items/{item_id}", response_model=UserListBasic)
-async def api_remove_item_from_list(list_id: str, item_id: str, user_id: str = Depends(get_current_user_uid)):
-    """Elimina un solo item de una lista."""
-    try:
-        result = await user_lists_col.update_one(
-            {"_id": ObjectId(list_id), "user_id": user_id},
-            {"$pull": {"items": item_id}}
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID de lista inválido")
-
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
-
-
-    updated_doc = await user_lists_col.find_one({"_id": ObjectId(list_id)})
-
-    return UserListBasic(
-        list_id=str(updated_doc["_id"]),
-        name=updated_doc.get("name"),
-        icon_name=updated_doc.get("icon_name", "default"),
-        color_hex=updated_doc.get("color_hex", "#FFFFFF"),
-        item_count=len(updated_doc.get("items", []))
-    )
 
 
 @app.get("/item/{item_id}", response_model=ItemDetailResponse)
@@ -1568,36 +1297,6 @@ async def api_get_item_details(item_id: str):
     if details is None:
         raise HTTPException(status_code=404, detail=f"Item with ID '{item_id}' not found")
     return details
-
-
-@app.get("/user/usage", response_model=UserUsageStatus)
-async def api_get_user_usage(user_id: str = Depends(get_current_user_uid)):
-    today_utc_str = datetime.now(timezone.utc).strftime('%Y-%m-%d')
-    sessions_today = await sessions_col.count_documents({
-        "user_id": user_id,
-        "created_date_utc": today_utc_str
-    })
-
-    remaining = max(0, SESSION_DAILY_LIMIT - sessions_today)
-
-    return UserUsageStatus(
-        daily_limit=SESSION_DAILY_LIMIT,
-        sessions_today=sessions_today,
-        remaining_today=remaining
-    )
-
-
-@app.put("/lists/{list_id}/archive", response_model=UserListBasic)
-async def api_archive_list(list_id: str, user_id: str = Depends(get_current_user_uid)):
-    # Llamamos al helper con True
-    return await _set_list_archive_status(list_id, user_id, archive=True)
-
-
-@app.put("/lists/{list_id}/unarchive", response_model=UserListBasic)
-async def api_unarchive_list(list_id: str, user_id: str = Depends(get_current_user_uid)):
-    # Llamamos al helper con False
-    return await _set_list_archive_status(list_id, user_id, archive=False)
-
 
 @app.post("/favorites/{item_id}", status_code=201)
 async def api_add_favorite(item_id: str, user_id: str = Depends(get_outsystems_user)):
@@ -1632,80 +1331,57 @@ async def api_remove_favorite(item_id: str, user_id: str = Depends(get_outsystem
     return {"status": "success", "message": "Item eliminado de favoritos"}
 
 # Endpoint para randomizar
-@app.post("/session/{session_id}/randomize", response_model=SeedResponse)
-async def api_session_randomize(session_id: str, user_id: str = Depends(get_current_user_uid)):
-    # Helper async
-    s = await get_session(session_id)
-    if not s or s["user_id"] != user_id:
-        raise HTTPException(404, "Session not found or unauthorized")
-    if bool(s.get("finished", False)):
-        raise HTTPException(400, "Session already finished")
+# @app.post("/session/{session_id}/randomize", response_model=SeedResponse)
+# async def api_session_randomize(session_id: str, user_id: str = Depends(get_current_user_uid)):
+#     # Helper async
+#     s = await get_session(session_id)
+#     if not s or s["user_id"] != user_id:
+#         raise HTTPException(404, "Session not found or unauthorized")
+#     if bool(s.get("finished", False)):
+#         raise HTTPException(400, "Session already finished")
 
-    shown_in_session = s.get("shown", [])
-    history = s.get("history", [])
+#     shown_in_session = s.get("shown", [])
+#     history = s.get("history", [])
 
-    exclude_ids = list(shown_in_session)
-    if history:
-        exclude_ids.append(history[-1][0])
+#     exclude_ids = list(shown_in_session)
+#     if history:
+#         exclude_ids.append(history[-1][0])
 
-    pipeline = [
-        {"$match": {
-            "domain": s["domain"],
-            "itemId": {"$nin": exclude_ids}
-        }},
-        {"$sample": {"size": 1}},
-        {"$project": {"embedding": 0}}
-    ]
+#     pipeline = [
+#         {"$match": {
+#             "domain": s["domain"],
+#             "itemId": {"$nin": exclude_ids}
+#         }},
+#         {"$sample": {"size": 1}},
+#         {"$project": {"embedding": 0}}
+#     ]
 
-    # Motor: aggregate -> to_list
-    cursor = items_col.aggregate(pipeline)
-    results = await cursor.to_list(length=1)
+#     # Motor: aggregate -> to_list
+#     cursor = items_col.aggregate(pipeline)
+#     results = await cursor.to_list(length=1)
 
-    if not results:
-        # Motor: update_one
-        await sessions_col.update_one(
-            {"session_id": session_id},
-            {"$set": {"finished": True, "history": history, "shown": shown_in_session}}
-        )
-        return SeedResponse(seed_item=None)
+#     if not results:
+#         # Motor: update_one
+#         await sessions_col.update_one(
+#             {"session_id": session_id},
+#             {"$set": {"finished": True, "history": history, "shown": shown_in_session}}
+#         )
+#         return SeedResponse(seed_item=None)
 
-    new_doc = results[0]
-    new_seed = row_to_recitem(new_doc)
+#     new_doc = results[0]
+#     new_seed = row_to_recitem(new_doc)
 
-    # Motor: update_one
-    await sessions_col.update_one(
-        {"session_id": session_id},
-        {"$set": {
-            "last_item_id": new_seed.item_id,
-            "history": history,
-            "shown": shown_in_session
-        }}
-    )
+#     # Motor: update_one
+#     await sessions_col.update_one(
+#         {"session_id": session_id},
+#         {"$set": {
+#             "last_item_id": new_seed.item_id,
+#             "history": history,
+#             "shown": shown_in_session
+#         }}
+#     )
 
-    return SeedResponse(seed_item=new_seed)
-
-
-@app.post("/users/profile")
-async def create_or_update_profile(
-        profile_data: UserProfileRequest,
-        user_id: str = Depends(get_current_user_uid)
-):
-    try:
-        # Motor: await update_one
-        await db.users.update_one(
-            {"_id": user_id},
-            {"$set": {
-                "age": profile_data.age,
-                "name": profile_data.name,
-                "updated_at": datetime.now()
-            }},
-            upsert=True
-        )
-        return {"status": "success", "message": "Perfil guardado"}
-
-    except Exception as error:
-        print(f"Error DB: {error}")
-        raise HTTPException(status_code=500, detail="Error interno guardando perfil")
+#     return SeedResponse(seed_item=new_seed)
 
 @app.get("/users/get-email/{username}" , response_model = UserLookupResponse)
 async def get_email(username: str):
@@ -1714,31 +1390,6 @@ async def get_email(username: str):
         return {"email": user["email"]}
     else:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
-
-
-@app.post("/users/create")
-async def create_user(user: UserCreate):
-
-    # Verificar que el nombre de usuario no esté registrado
-    existing_user = await db.users.find_one({"name": {"$regex": f"^{user.username}$", "$options": "i"}})
-    if existing_user:
-        raise HTTPException(400, "Username ya registrado")
-
-    # Verificar que el email no esté registrado
-    if await db.users.find_one({"email": user.email}):
-        raise HTTPException(400, "Email ya registrado")
-
-    new_user_doc = {
-        "firebaseUid": user.firebaseUid,
-        "email": user.email,
-        "name": user.username,
-        "age": user.age,
-        "profile_picture": user.profile_picture,
-        "role": "USER",
-        "createdAt": datetime.now(timezone.utc)
-    }
-    result = await db.users.insert_one(new_user_doc)
-    return {"status": "User created", "id": str(result.inserted_id)}
 
 
 @app.get("/users/check-email/{email}")
@@ -1760,17 +1411,6 @@ async def check_username_availability(username: str):
     if existing_user:
         return {"available": False}  # Ocupado
     return {"available": True}  # Libre
-
-@app.get("/users/me/exists")
-async def check_user_exists(
-
-    current_user_uid: str = Depends(get_current_user_uid)
-):
-    user = await db.users.find_one({"firebaseUid": current_user_uid})
-    if user:
-        return {"exists": True}
-    else:
-        return {"exists": False}
 
 
 @app.get("/users/{firebase_uid}", response_model=UserProfileResponse)
@@ -2385,7 +2025,6 @@ async def get_similar_items(item_id: str, limit: int = 10):
             genres=_parse_list_or_string(doc.get("genres")),
             year=year,
             artist=doc.get("artist"),
-            google_avg_rating=_safe_int(doc.get("google_avg_rating")),
             imdb_score=_safe_float(doc.get("imdb_score")),
             listeners=_safe_int(doc.get("listeners")),
             director=doc.get("director"),

@@ -1,14 +1,8 @@
 import httpx
 import re
 from fastapi import APIRouter, HTTPException
-import asyncio
 import re
-from motor.motor_asyncio import AsyncIOMotorClient
 import httpx
-from googletrans import Translator
-import logging
-import os
-from dotenv import load_dotenv
 router = APIRouter()
 
 TMDB_API_KEY = "647d6ce7695cbea9dafc5c77378bac2b"
