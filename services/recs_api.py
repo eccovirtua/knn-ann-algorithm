@@ -163,7 +163,7 @@ class ItemDetailResponse(RecItem): # Inherit from RecItem to include basic field
     director: Optional[str] = None
     domain_type: Optional[str] = None
     overview: Optional[str] = None
-    genres_es: Optional[List[str]] = None
+    genres_es_text: Optional[str] = None
     keywords_es: Optional[List[str]] = None
 class FinalListResponse(BaseModel):
     recommendations: List[RecItem]
@@ -340,21 +340,6 @@ async def _get_list_and_map_to_basic(list_id: str) -> UserListBasic:
         item_count=len(updated_doc.get("items", []))
     )
 
-async def _set_list_archive_status(list_id: str, user_id: str, archive: bool) -> UserListBasic:
-    """Helper para cambiar el estado de archivo de una lista."""
-    try:
-        result = await user_lists_col.update_one(
-            {"_id": ObjectId(list_id), "user_id": user_id},
-            {"$set": {"is_archived": archive}}
-        )
-    except Exception:
-        raise HTTPException(status_code=400, detail="ID de lista inválido")
-
-    if result.matched_count == 0:
-        raise HTTPException(status_code=404, detail="Lista no encontrada o no pertenece al usuario")
-
-    # Reutilizamos el helper de mapeo que creamos en la pregunta anterior
-    return await _get_list_and_map_to_basic(list_id)
 
 def _col(df: pd.Series, name: str, default):
     try:
@@ -1196,6 +1181,11 @@ async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
     # Extraer el año
     year_match = re.search(r"\((\d{4})\)", doc.get('title', ''))
     year = year_match.group(1) if year_match else doc.get("year_str")
+    # Obtenemos la lista limpia usando tu función de ayuda
+    lista_generos_es = _parse_list_or_string(doc.get("genres_es"))
+
+    # La convertimos a un solo texto separado por comas (Ej: "Acción, Comedia, Drama")
+    texto_generos_es = ", ".join(lista_generos_es) if lista_generos_es else None
 
     return ItemDetailResponse(
         item_id=rec_item.item_id,
@@ -1213,7 +1203,7 @@ async def get_item_details(item_id: str) -> Optional[ItemDetailResponse]:
         director=doc.get("director"),
         domain_type=doc.get("domain_type"),
         overview=doc.get("overview"),
-        genres_es=_parse_list_or_string(doc.get("genres_es")),
+        genres_es_text=texto_generos_es,
         keywords_es=_parse_list_or_string(doc.get("keywords_es"))
     )
 
