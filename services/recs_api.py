@@ -1326,50 +1326,43 @@ async def api_remove_favorite(item_id: str, user_id: str = Depends(get_outsystem
 # Endpoint para randomizar
 @app.post("/session/{session_id}/randomize", response_model=SeedResponse)
 async def api_session_randomize(session_id: str, user_id: str = Depends(get_outsystems_user)):
-    # 1. Obtener y validar la sesión
     s = await get_session(session_id)
     if not s or s.get("user_id") != user_id:
         raise HTTPException(status_code=404, detail="Session not found or unauthorized")
-    if s.get("finished", False):
-        raise HTTPException(status_code=400, detail="Session already finished")
-
-    # 2. Preparar exclusiones (Mostrados + Historial) de forma optimizada
+    
+    # Unificamos exclusiones: Votados (history), Mostrados (shown) y Saltados (skipped)
+    # Usamos set para que la búsqueda sea O(1)
     exclude_ids = set(s.get("shown", []))
+    exclude_ids.update(s.get("skipped", [])) # Agregamos los que el usuario ya saltó
     for h in s.get("history", []):
-        exclude_ids.add(h[0]) # Aseguramos que nada del historial se repita
+        exclude_ids.add(h[0])
 
-    # 3. Pipeline de agregación
     pipeline = [
         {"$match": {
             "domain": s.get("domain"),
             "itemId": {"$nin": list(exclude_ids)}
         }},
         {"$sample": {"size": 1}},
-        {"$project": {"embedding": 0}} # Excluimos los vectores pesados
+        {"$project": {"embedding": 0}}
     ]
 
     cursor = items_col.aggregate(pipeline)
     results = await cursor.to_list(length=1)
 
-    # 4. Caso: Se acabaron las películas en la base de datos
     if not results:
-        # Solo actualizamos el flag, no reescribimos todo el array
-        await sessions_col.update_one(
-            {"session_id": session_id},
-            {"$set": {"finished": True}} 
-        )
+        await sessions_col.update_one({"session_id": session_id}, {"$set": {"finished": True}})
         return SeedResponse(seed_item=None)
 
-    # 5. Caso de Éxito: Preparar nueva película
     new_doc = results[0]
     new_seed = await row_to_recitem(new_doc)
 
-    # 6. Actualizar BD: Setear el item actual y agregarlo a los ya vistos
+    # ACTUALIZACIÓN CLAVE:
+    # No tocamos "shown" ni "history". Usamos "skipped" para la exclusión futura.
     await sessions_col.update_one(
         {"session_id": session_id},
         {
             "$set": {"last_item_id": new_seed.item_id},
-            "$addToSet": {"shown": new_seed.item_id} # Lo inyecta a la lista eficientemente
+            "$addToSet": {"skipped": new_seed.item_id} # <--- Lista de "salteados"
         }
     )
 
