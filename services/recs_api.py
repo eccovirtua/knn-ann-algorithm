@@ -1595,6 +1595,19 @@ async def api_generate_cold_start_recs(
             upsert=True
         )
     # =======================================================================
+    # 2. Guardar en Historial / Vistas
+        # Esto asegura que si son sus favoritas, el sistema ya las cuente como vistas
+        await user_watched_col.update_one(
+            {"user_id": user_id, "item_id": item_id},
+            {"$set": {
+                "user_id": user_id, 
+                "item_id": item_id, 
+                "domain": "movie",
+                "watched_at": datetime.utcnow(),
+                "status": "watched"
+            }},
+            upsert=True
+        )
 
     # 1. Traer los documentos de las películas seleccionadas (con sus vectores)
     docs = await items_col.find({
