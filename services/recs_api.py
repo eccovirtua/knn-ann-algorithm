@@ -525,10 +525,10 @@ async def compute_next_seed(domain: str, user_id: str = None, session_history: L
     })
 
     pipeline.append({"$project": {"embedding": 0}})
-    pipeline.append({"$limit": 10}) # Limitamos a 10 candidatos para reordenar
+    pipeline.append({"$limit": 50}) # ABRIMOS EL EMBUDO A 50 CANDIDATOS
 
     cursor = items_col.aggregate(pipeline)
-    results = await cursor.to_list(length=10)
+    results = await cursor.to_list(length=50)
 
     if results:
         # APLICAR SERENDIPITY RE-RANKING
@@ -1658,21 +1658,21 @@ async def api_generate_cold_start_recs(
         pipeline = [
             {
                 "$vectorSearch": {
-                    "index": "vector_index", # Usa el nombre de tu índice vectorial en Mongo
+                    "index": "vector_index", 
                     "path": "embedding",
                     "queryVector": centroid,
                     "numCandidates": 150,
-                    "limit": 45
+                    "limit": 100 # Traemos 100 candidatas altamente relevantes
                 }
             },
             {
                 "$match": {
                     "domain": "movie",
-                    "itemId": {"$nin": req.selected_item_ids} # Excluir las que ya seleccionó
+                    "itemId": {"$nin": req.selected_item_ids} # (O items_to_exclude en la otra función)
                 }
             },
-            {"$project": {"embedding": 0}},
-            {"$limit": 45} # Devolvemos 45 películas por fila
+            {"$sample": {"size": 45}}, # MÁGIA: Elegimos 45 al azar dentro del top 100
+            {"$project": {"embedding": 0}}
         ]
 
         cursor = items_col.aggregate(pipeline)
@@ -1806,17 +1806,17 @@ async def api_dynamic_recommendations(user_id: str = Depends(get_outsystems_user
                     "path": "embedding",
                     "queryVector": centroid,
                     "numCandidates": 150,
-                    "limit": 45
+                    "limit": 100 # Traemos 100 candidatas altamente relevantes
                 }
             },
             {
                 "$match": {
                     "domain": "movie",
-                    "itemId": {"$nin": items_to_exclude} # <--- LA MAGIA ESTÁ AQUÍ
+                    "itemId": {"$nin": items_to_exclude} # (O items_to_exclude en la otra función)
                 }
             },
-            {"$project": {"embedding": 0}},
-            {"$limit": 45} 
+            {"$sample": {"size": 45}}, # MÁGIA: Elegimos 45 al azar dentro del top 100
+            {"$project": {"embedding": 0}}
         ]
 
         cursor = items_col.aggregate(pipeline)
@@ -1982,52 +1982,64 @@ async def advanced_search(
 
 @app.get("/items/{item_id}/similar", response_model=List[ItemDetailResponse])
 async def get_similar_items(item_id: str, limit: int = 10):
-    # 1. Obtenemos el documento base para saber de qué trata
+    # 1. Obtenemos el documento base
     base_doc = await items_col.find_one({"itemId": item_id})
     if not base_doc:
-        return [] # O devolver un error 404
+        return []
 
-    # 2. Extraemos los géneros para usarlos como filtro de búsqueda
-    base_genres = _parse_list_or_string(base_doc.get("genres")) or []
-    
-    # 3. Construimos la consulta de MongoDB
-    query = {
-        "itemId": {"$ne": item_id} # $ne = Not Equal (Excluir la película actual)
-    }
-    
-    # Si la película base tiene géneros, buscamos películas que compartan alguno ($in)
-    if base_genres:
-        query["genres"] = {"$in": [re.compile(g, re.IGNORECASE) for g in base_genres]}
+    # 2. BÚSQUEDA VECTORIAL (Similitud Real de Trama/Concepto)
+    if "embedding" in base_doc:
+        pipeline = [
+            {
+                "$vectorSearch": {
+                    "index": "vector_index",
+                    "path": "embedding",
+                    "queryVector": base_doc["embedding"],
+                    "numCandidates": 100,
+                    "limit": limit * 3 # Traemos el triple de candidatas
+                }
+            },
+            {
+                "$match": {
+                    "itemId": {"$ne": item_id},
+                    "domain": base_doc.get("domain", "movie")
+                }
+            },
+            {"$project": {"embedding": 0}}
+        ]
         
-    # Si quieres limitar a que solo recomiende del mismo tipo (ej. película con película, no película con serie)
-    domain_type = base_doc.get("domain_type")
-    if domain_type:
-        query["domain_type"] = domain_type
+        cursor = items_col.aggregate(pipeline)
+        docs = await cursor.to_list(length=limit * 3)
+        
+        # 3. EL TRUCO PARA EVITAR REPETICIONES EXACTAS
+        # Desordenamos un poco el top 30 para que cada vez que entres se sienta fresco, 
+        # pero garantizando que todas son matemáticamente similares.
+        import random
+        random.shuffle(docs)
+        docs = docs[:limit]
 
-    # 4. Ejecutamos la búsqueda, ordenando por puntuación IMDB de mayor a menor
-    cursor = items_col.find(query).sort("imdb_score", -1).limit(limit)
-    
+    else:
+        # Fallback de seguridad por si una película no tiene vector
+        query = {"itemId": {"$ne": item_id}, "domain": "movie"}
+        base_genres = _parse_list_or_string(base_doc.get("genres")) or []
+        if base_genres:
+            query["genres"] = {"$in": [re.compile(g, re.IGNORECASE) for g in base_genres]}
+        cursor = items_col.find(query).sort("imdb_score", -1).limit(limit)
+        docs = await cursor.to_list(length=limit)
+
+    # 4. Mapear resultados
     similar_items = []
-    async for doc in cursor:
+    for doc in docs:
         rec_item = await row_to_recitem(doc, distance=0.0)
-        
         year_match = re.search(r"\((\d{4})\)", doc.get('title', ''))
         year = year_match.group(1) if year_match else doc.get("year_str")
 
-        # Reutilizamos el modelo de respuesta
         similar_items.append(ItemDetailResponse(
-            item_id=rec_item.item_id,
-            title=rec_item.title,
-            distance=rec_item.distance,
-            image_url=rec_item.image_url,
-            genres=_parse_list_or_string(doc.get("genres")),
-            year=year,
-            artist=doc.get("artist"),
-            imdb_score=_safe_float(doc.get("imdb_score")),
-            listeners=_safe_int(doc.get("listeners")),
-            director=doc.get("director"),
-            domain_type=doc.get("domain_type"),
-            overview=doc.get("overview"),
+            item_id=rec_item.item_id, title=rec_item.title, distance=rec_item.distance,
+            image_url=rec_item.image_url, genres=_parse_list_or_string(doc.get("genres")),
+            year=year, artist=doc.get("artist"), imdb_score=_safe_float(doc.get("imdb_score")),
+            listeners=_safe_int(doc.get("listeners")), director=doc.get("director"),
+            domain_type=doc.get("domain_type"), overview=doc.get("overview"),
             genres_es=_parse_list_or_string(doc.get("genres_es")),
             keywords_es=_parse_list_or_string(doc.get("keywords_es"))
         ))
